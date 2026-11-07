@@ -5,7 +5,8 @@
     <application
         android:theme="@android:style/Theme.Material.Light.NoActionBar"
         android:label="Manajemen MikroTik"
-        android:usesCleartextTraffic="true">
+        android:usesCleartextTraffic="true"
+        android:hardwareAccelerated="true">
 
         <activity
             android:name=".MainActivity"
