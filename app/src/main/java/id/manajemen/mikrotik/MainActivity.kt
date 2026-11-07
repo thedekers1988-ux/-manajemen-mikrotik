@@ -6,22 +6,26 @@ import android.app.AlertDialog
 import android.os.Bundle
 import android.graphics.Color
 import android.graphics.Typeface
-import android.graphics.drawable.GradientDrawable
+import android.text.InputType
 import android.view.Gravity
-import android.view.View
 import android.widget.*
+import android.text.InputFilter
 import org.json.JSONArray
 import org.json.JSONObject
 
 class MainActivity : Activity() {
 
+    private val bg = Color.rgb(15, 23, 42)
+    private val card = Color.rgb(30, 41, 59)
+    private val blue = Color.rgb(37, 99, 235)
+    private val white = Color.WHITE
+    private val gray = Color.LTGRAY
+
     private val prefs by lazy {
         getSharedPreferences("mikrotik_data", MODE_PRIVATE)
     }
 
-    private val blue = Color.rgb(35, 115, 230)
-    private val dark = Color.rgb(15, 23, 42)
-    private val white = Color.WHITE
+    private lateinit var root: LinearLayout
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -31,17 +35,10 @@ class MainActivity : Activity() {
     private fun dp(value: Int): Int =
         (value * resources.displayMetrics.density).toInt()
 
-    private fun cardBackground(color: Int): GradientDrawable {
-        return GradientDrawable().apply {
-            setColor(color)
-            cornerRadius = dp(16).toFloat()
-        }
-    }
-
     private fun text(
         value: String,
         size: Float,
-        color: Int,
+        color: Int = white,
         bold: Boolean = false
     ): TextView {
         return TextView(this).apply {
@@ -49,133 +46,8 @@ class MainActivity : Activity() {
             textSize = size
             setTextColor(color)
             if (bold) setTypeface(null, Typeface.BOLD)
-            setPadding(dp(12), dp(8), dp(12), dp(8))
+            setPadding(dp(4), dp(8), dp(4), dp(8))
         }
-    }
-
-    private fun render() {
-        val scroll = ScrollView(this)
-        val layout = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(18), dp(24), dp(18), dp(24))
-            setBackgroundColor(dark)
-        }
-
-        scroll.addView(layout)
-        setContentView(scroll)
-
-        layout.addView(text(
-            "MANAJEMEN MikroTik",
-            25f, white, true
-        ))
-
-        layout.addView(text(
-            "Monitoring dan Manajemen Jaringan",
-            14f, Color.LTGRAY
-        ))
-
-        val status = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            background = cardBackground(
-                Color.rgb(30, 41, 59)
-            )
-            setPadding(dp(12), dp(12), dp(12), dp(12))
-        }
-
-        status.addView(text(
-            "DASHBOARD",
-            17f, white, true
-        ))
-
-        status.addView(text(
-            "Aplikasi berjalan langsung di HP Android",
-            14f, Color.GREEN
-        ))
-
-        status.addView(text(
-            "Server Kali Linux: Tidak diperlukan",
-            13f, Color.LTGRAY
-        ))
-
-        layout.addView(status, marginParams())
-
-        val addButton = Button(this).apply {
-            text = "+ TAMBAH MIKROTIK"
-            setTextColor(white)
-            background = cardBackground(blue)
-            setOnClickListener { addRouter() }
-        }
-
-        layout.addView(addButton, marginParams())
-
-        layout.addView(text(
-            "DAFTAR ROUTER",
-            19f, white, true
-        ))
-
-        val routers = loadRouters()
-
-        if (routers.length() == 0) {
-            layout.addView(text(
-                "Belum ada MikroTik ditambahkan.\nTekan tombol Tambah MikroTik.",
-                14f, Color.LTGRAY
-            ))
-        }
-
-        for (i in 0 until routers.length()) {
-            val router = routers.getJSONObject(i)
-
-            val item = LinearLayout(this).apply {
-                orientation = LinearLayout.VERTICAL
-                background = cardBackground(
-                    Color.rgb(30, 41, 59)
-                )
-                setPadding(dp(10), dp(10), dp(10), dp(10))
-            }
-
-            item.addView(text(
-                router.optString("name"),
-                17f, white, true
-            ))
-
-            item.addView(text(
-                "IP: ${router.optString("ip")}",
-                14f, Color.LTGRAY
-            ))
-
-            item.addView(text(
-                "API Port: ${router.optString("port")}",
-                13f, Color.LTGRAY
-            ))
-
-            val delete = Button(this).apply {
-                text = "Hapus Router"
-                setOnClickListener {
-                    AlertDialog.Builder(this@MainActivity)
-                        .setMessage("Hapus router ini?")
-                        .setPositiveButton("Hapus") { _, _ ->
-                            routers.remove(i)
-                            saveRouters(routers)
-                            render()
-                        }
-                        .setNegativeButton("Batal", null)
-                        .show()
-                }
-            }
-
-            item.addView(delete)
-            layout.addView(item, marginParams())
-        }
-
-        layout.addView(text(
-            "PELANGGAN PPPoE",
-            19f, white, true
-        ))
-
-        layout.addView(text(
-            "Data pelanggan akan ditampilkan setelah koneksi RouterOS API diaktifkan.",
-            14f, Color.LTGRAY
-        ))
     }
 
     private fun marginParams(): LinearLayout.LayoutParams {
@@ -201,7 +73,145 @@ class MainActivity : Activity() {
             .apply()
     }
 
+    private fun render() {
+
+        root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(20), dp(20), dp(20))
+            setBackgroundColor(bg)
+        }
+
+        val scroll = ScrollView(this)
+        scroll.addView(root)
+
+        setContentView(scroll)
+
+        root.addView(
+            text("MANAJEMEN MikroTik", 27f, white, true),
+            marginParams()
+        )
+
+        root.addView(
+            text("Monitoring dan Manajemen Jaringan", 16f, gray),
+            marginParams()
+        )
+
+        val dashboard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(20), dp(20), dp(20))
+            setBackgroundColor(card)
+        }
+
+        dashboard.addView(
+            text("DASHBOARD", 20f, white, true)
+        )
+
+        dashboard.addView(
+            text("Aplikasi berjalan langsung di HP Android", 16f,
+                Color.GREEN)
+        )
+
+        dashboard.addView(
+            text("Server Kali Linux: Tidak diperlukan", 14f, gray)
+        )
+
+        root.addView(dashboard, marginParams())
+
+        val addButton = Button(this).apply {
+            text = "+ TAMBAH MIKROTIK"
+            setTextColor(white)
+            setBackgroundColor(blue)
+            textSize = 16f
+            setOnClickListener {
+                addRouter()
+            }
+        }
+
+        root.addView(addButton, marginParams())
+
+        root.addView(
+            text("DAFTAR ROUTER", 21f, white, true),
+            marginParams()
+        )
+
+        val routers = loadRouters()
+
+        if (routers.length() == 0) {
+            root.addView(
+                text(
+                    "Belum ada MikroTik ditambahkan.\nTekan tombol Tambah MikroTik.",
+                    15f, gray
+                )
+            )
+        }
+
+        for (i in 0 until routers.length()) {
+
+            val router = routers.getJSONObject(i)
+
+            val name = router.optString("name")
+            val ip = router.optString("ip")
+            val port = router.optString("port")
+
+            val item = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(dp(16), dp(12), dp(16), dp(12))
+                setBackgroundColor(card)
+            }
+
+            item.addView(
+                text(name, 18f, white, true)
+            )
+
+            item.addView(
+                text("IP: $ip:$port", 14f, gray)
+            )
+
+            item.addView(
+                text("User: ${router.optString("username")}", 14f, gray)
+            )
+
+            val delete = Button(this).apply {
+                text = "HAPUS ROUTER"
+                setOnClickListener {
+                    AlertDialog.Builder(this@MainActivity)
+                        .setTitle("Hapus Router")
+                        .setMessage("Hapus $name?")
+                        .setPositiveButton("Hapus") { _, _ ->
+                            val updated = JSONArray()
+                            for (j in 0 until routers.length()) {
+                                if (j != i) {
+                                    updated.put(routers.getJSONObject(j))
+                                }
+                            }
+                            saveRouters(updated)
+                            render()
+                        }
+                        .setNegativeButton("Batal", null)
+                        .show()
+                }
+            }
+
+            item.addView(delete)
+
+            root.addView(item, marginParams())
+        }
+
+        root.addView(
+            text("PELANGGAN PPPoE", 21f, white, true),
+            marginParams()
+        )
+
+        root.addView(
+            text(
+                "Data pelanggan akan ditampilkan setelah koneksi RouterOS API diaktifkan.",
+                15f, gray
+            )
+        )
+    }
+
     private fun addRouter() {
+
         val form = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(20), dp(10), dp(20), dp(10))
@@ -209,63 +219,132 @@ class MainActivity : Activity() {
 
         val name = EditText(this).apply {
             hint = "Nama MikroTik"
+            singleLine = true
         }
 
         val ip = EditText(this).apply {
-            hint = "IP MikroTik"
-            inputType = 0x00001002
+            hint = "Contoh: 192.168.1.150"
+            singleLine = true
+
+            // Keyboard teks agar tombol titik tersedia
+            inputType = InputType.TYPE_CLASS_TEXT or
+                    InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD
+
+            filters = arrayOf(
+                InputFilter.LengthFilter(15)
+            )
+        }
+
+        val username = EditText(this).apply {
+            hint = "Username MikroTik"
+            singleLine = true
+        }
+
+        val password = EditText(this).apply {
+            hint = "Password MikroTik"
+            singleLine = true
+            inputType = InputType.TYPE_CLASS_TEXT or
+                    InputType.TYPE_TEXT_VARIATION_PASSWORD
         }
 
         val port = EditText(this).apply {
-            hint = "Port API (8728)"
+            hint = "Port API"
             setText("8728")
-            inputType = 2
+            singleLine = true
+            inputType = InputType.TYPE_CLASS_NUMBER
         }
 
         form.addView(name)
         form.addView(ip)
+        form.addView(username)
+        form.addView(password)
         form.addView(port)
 
-        AlertDialog.Builder(this)
+        val dialog = AlertDialog.Builder(this)
             .setTitle("Tambah MikroTik")
             .setView(form)
-            .setPositiveButton("Simpan") { _, _ ->
+            .setPositiveButton("Simpan", null)
+            .setNegativeButton("Batal", null)
+            .create()
 
-                val n = name.text.toString().trim()
-                val address = ip.text.toString().trim()
-                val p = port.text.toString().trim()
+        dialog.setOnShowListener {
 
-                if (n.isEmpty() ||
-                    address.isEmpty() ||
-                    p.isEmpty()
-                ) {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE)
+                .setOnClickListener {
+
+                    val n = name.text.toString().trim()
+                    val address = ip.text.toString().trim()
+                    val user = username.text.toString().trim()
+                    val pass = password.text.toString()
+                    val p = port.text.toString().trim()
+
+                    if (n.isEmpty() ||
+                        address.isEmpty() ||
+                        user.isEmpty() ||
+                        pass.isEmpty() ||
+                        p.isEmpty()
+                    ) {
+                        Toast.makeText(
+                            this,
+                            "Lengkapi semua data",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                        return@setOnClickListener
+                    }
+
+                    if (!isValidIp(address)) {
+                        Toast.makeText(
+                            this,
+                            "Format IP tidak valid",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                        return@setOnClickListener
+                    }
+
+                    if ((p.toIntOrNull() ?: 0) !in 1..65535) {
+                        Toast.makeText(
+                            this,
+                            "Port tidak valid",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                        return@setOnClickListener
+                    }
+
+                    val routers = loadRouters()
+
+                    val router = JSONObject().apply {
+                        put("name", n)
+                        put("ip", address)
+                        put("username", user)
+                        put("password", pass)
+                        put("port", p)
+                    }
+
+                    routers.put(router)
+                    saveRouters(routers)
+
+                    dialog.dismiss()
+                    render()
+
                     Toast.makeText(
                         this,
-                        "Lengkapi semua data",
-                        Toast.LENGTH_LONG
+                        "Router berhasil disimpan",
+                        Toast.LENGTH_SHORT
                     ).show()
-                    return@setPositiveButton
                 }
+        }
 
-                val routers = loadRouters()
+        dialog.show()
+    }
 
-                val router = JSONObject().apply {
-                    put("name", n)
-                    put("ip", address)
-                    put("port", p)
-                }
+    private fun isValidIp(ip: String): Boolean {
+        val parts = ip.split(".")
 
-                routers.put(router)
-                saveRouters(routers)
-                render()
+        if (parts.size != 4) return false
 
-                Toast.makeText(
-                    this,
-                    "Router berhasil disimpan",
-                    Toast.LENGTH_SHORT
-                ).show()
-            }
-            .setNegativeButton("Batal", null)
-            .show()
+        return parts.all {
+            val number = it.toIntOrNull()
+            number != null && number in 0..255 && it.isNotEmpty()
+        }
     }
 }
