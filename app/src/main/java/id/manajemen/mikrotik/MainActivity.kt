@@ -1,3 +1,4 @@
+
 package id.manajemen.mikrotik
 
 import android.app.Activity
@@ -6,8 +7,8 @@ import android.os.Handler
 import android.os.Looper
 import android.webkit.WebView
 import android.webkit.WebViewClient
-import android.widget.TextView
 import android.widget.LinearLayout
+import android.widget.TextView
 import android.graphics.Color
 import com.chaquo.python.Python
 import com.chaquo.python.android.AndroidPlatform
@@ -16,7 +17,6 @@ import kotlin.concurrent.thread
 class MainActivity : Activity() {
 
     private lateinit var webView: WebView
-    private val handler = Handler(Looper.getMainLooper())
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -27,10 +27,10 @@ class MainActivity : Activity() {
         }
 
         val status = TextView(this).apply {
-            text = "MANAJEMEN MIKROTIK\nMenyiapkan koneksi..."
+            text = "MANAJEMEN MIKROTIK\nMenyiapkan aplikasi..."
             textSize = 18f
             setTextColor(Color.WHITE)
-            setPadding(24, 30, 24, 30)
+            setPadding(20, 24, 20, 24)
         }
 
         webView = WebView(this).apply {
@@ -58,16 +58,21 @@ class MainActivity : Activity() {
                 }
 
                 val module = Python.getInstance().getModule("app")
-                module.callAttr("start_server")
 
-                handler.postDelayed({
+                module.callAttr(
+                    "start_server",
+                    filesDir.absolutePath
+                )
+
+                Handler(Looper.getMainLooper()).postDelayed({
                     status.text = "MANAJEMEN MIKROTIK"
                     webView.loadUrl("http://127.0.0.1:8765/")
                 }, 1500)
 
             } catch (e: Exception) {
-                handler.post {
-                    status.text = "GAGAL MENJALANKAN SERVER:\n${e.message}"
+                Handler(Looper.getMainLooper()).post {
+                    status.text =
+                        "GAGAL MEMBUKA APLIKASI:\n${e.message}"
                 }
             }
         }
