@@ -2,7 +2,7 @@
 from flask import Flask, request, redirect, render_template_string, jsonify
 from routeros_api import RouterOsApiPool
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from urllib.parse import quote
 import json
 import threading
@@ -18,22 +18,27 @@ STATE_DB = DATA_DIR / "offline_state.json"
 
 _server_thread = None
 _server_lock = threading.Lock()
-router_locks = {}
 
 
 def now_iso():
-    return datetime.now(timezone.utc).isoformat()
+    # Waktu Indonesia Tengah (WITA)
+    return datetime.now(timezone(timedelta(hours=8))).isoformat()
 
 
 def parse_time(value):
     try:
         return datetime.fromisoformat(value)
     except Exception:
-        return datetime.now(timezone.utc)
+        return datetime.now(timezone(timedelta(hours=8)))
 
 
 def duration_text(start):
-    seconds = max(0, int((datetime.now(timezone.utc) - parse_time(start)).total_seconds()))
+    seconds = max(
+        0,
+        int((datetime.now(timezone(timedelta(hours=8))) -
+             parse_time(start)).total_seconds())
+    )
+
     days, seconds = divmod(seconds, 86400)
     hours, seconds = divmod(seconds, 3600)
     minutes, seconds = divmod(seconds, 60)
@@ -58,8 +63,10 @@ def read_json(path, default):
 def write_json(path, data):
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     temp = path.with_suffix(".tmp")
+
     with open(temp, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
+
     temp.replace(path)
 
 
@@ -70,6 +77,7 @@ def setup_storage(data_dir=None):
         DATA_DIR = Path(data_dir)
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+
     ROUTERS_DB = DATA_DIR / "routers.json"
     CUSTOMERS_DB = DATA_DIR / "customers.json"
     STATE_DB = DATA_DIR / "offline_state.json"
@@ -124,16 +132,13 @@ def connect_router(router):
 
 def fetch_router_data(router):
     pool = None
+
     try:
         pool = connect_router(router)
         api = pool.get_api()
 
         active = api.get_resource("/ppp/active").get()
-
-        try:
-            secrets = api.get_resource("/ppp/secret").get()
-        except Exception:
-            secrets = []
+        secrets = api.get_resource("/ppp/secret").get()
 
         return active, secrets, None
 
@@ -154,21 +159,18 @@ def update_offline_state(router, active, secrets):
     router_states = states.setdefault(key, {})
 
     active_names = {
-        str(item.get("name", ""))
-        for item in active
-        if item.get("name")
+        str(x.get("name", ""))
+        for x in active if x.get("name")
     }
 
     secret_names = {
-        str(item.get("name", ""))
-        for item in secrets
-        if item.get("name")
+        str(x.get("name", ""))
+        for x in secrets if x.get("name")
     }
 
-    known_names = active_names | secret_names
     timestamp = now_iso()
 
-    for username in known_names:
+    for username in active_names | secret_names:
         state = router_states.setdefault(username, {})
 
         if username in active_names:
@@ -190,23 +192,22 @@ def build_customers(router, active, secrets):
     states = update_offline_state(router, active, secrets)
 
     active_map = {
-        str(item.get("name", "")): item
-        for item in active
-        if item.get("name")
+        str(x.get("name", "")): x
+        for x in active if x.get("name")
     }
 
     secret_map = {
-        str(item.get("name", "")): item
-        for item in secrets
-        if item.get("name")
+        str(x.get("name", "")): x
+        for x in secrets if x.get("name")
     }
 
     names = sorted(set(active_map) | set(secret_map))
     result = []
 
     for username in names:
-        item = active_map.get(username, {})
+        active_item = active_map.get(username, {})
         secret = secret_map.get(username, {})
+
         saved = metadata.get(customer_key(router, username), {})
         state = states.get(username, {})
 
@@ -215,14 +216,25 @@ def build_customers(router, active, secrets):
 
         result.append({
             "name": username,
-            "address": item.get("address", "-"),
-            "service": item.get("service") or secret.get("service") or "-",
+            "address": active_item.get("address", "-"),
+            "service": (
+                active_item.get("service")
+                or secret.get("service")
+                or "-"
+            ),
             "profile": secret.get("profile", "-"),
-            "uptime": item.get("uptime", "-") if online else "-",
-            "caller_id": item.get("caller-id", "-"),
+            "uptime": active_item.get("uptime", "-") if online else "-",
+            "caller_id": (
+                active_item.get("caller-id")
+                or secret.get("caller-id")
+                or "-"
+            ),
             "online": online,
             "offline_since": offline_since,
-            "offline_duration": duration_text(offline_since) if offline_since and not online else "-",
+            "offline_duration": (
+                duration_text(offline_since)
+                if offline_since and not online else "-"
+            ),
             "phone": saved.get("phone", ""),
             "location": saved.get("location", ""),
             "lat": saved.get("lat", ""),
@@ -239,48 +251,175 @@ PAGE = r"""
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Manajemen MikroTik</title>
+
 <style>
 *{box-sizing:border-box}
-body{margin:0;background:#0b1220;color:#edf3ff;font-family:Arial,sans-serif}
-header{padding:20px;background:#111d30;border-bottom:1px solid #263b59;position:sticky;top:0;z-index:5}
+
+body{
+ margin:0;
+ background:#0b1220;
+ color:#edf3ff;
+ font-family:Arial,sans-serif
+}
+
+header{
+ padding:20px;
+ background:#111d30;
+ border-bottom:1px solid #263b59;
+ position:sticky;
+ top:0;
+ z-index:5
+}
+
 .brand{font-size:21px;font-weight:bold}
 .sub{color:#9eafc9;font-size:12px;margin-top:5px}
+
 main{max-width:900px;margin:auto;padding:15px}
-.card{background:#14243a;border:1px solid #304765;border-radius:18px;padding:17px;margin-bottom:15px}
-.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
-.stat{padding:17px;border-radius:14px;min-height:100px}
-.stat b{display:block;font-size:30px;margin:8px 0}
-.green{background:#075b3b}.red{background:#762b3a}
-.blue{background:#153d78}.purple{background:#463071}
+
+.card{
+ background:#14243a;
+ border:1px solid #304765;
+ border-radius:18px;
+ padding:17px;
+ margin-bottom:15px
+}
+
+.grid{
+ display:grid;
+ grid-template-columns:repeat(2,minmax(0,1fr));
+ gap:10px
+}
+
+.stat{
+ display:block;
+ color:white;
+ text-decoration:none;
+ padding:17px;
+ border-radius:14px;
+ min-height:110px;
+ cursor:pointer
+}
+
+.stat b{
+ display:block;
+ font-size:30px;
+ margin:8px 0
+}
+
+.green{background:#075b3b}
+.red{background:#762b3a}
+.blue{background:#153d78}
+.purple{background:#463071}
+
+.stat:active{opacity:.75}
+
 .muted{color:#9eafc9;font-size:13px}
+
 button,input{font:inherit}
-input{width:100%;padding:13px;margin:6px 0;border-radius:10px;border:1px solid #405574;background:#0b1728;color:white}
-button,.btn{display:inline-block;text-align:center;text-decoration:none;border:0;border-radius:10px;padding:12px;background:#1877ed;color:white;font-weight:bold;cursor:pointer}
-button.full{width:100%;margin-top:8px}
+
+input{
+ width:100%;
+ padding:13px;
+ margin:6px 0;
+ border-radius:10px;
+ border:1px solid #405574;
+ background:#0b1728;
+ color:white
+}
+
+button,.btn{
+ display:inline-block;
+ text-align:center;
+ text-decoration:none;
+ border:0;
+ border-radius:10px;
+ padding:12px;
+ background:#1877ed;
+ color:white;
+ font-weight:bold;
+ cursor:pointer
+}
+
+button.full,.btn.full{
+ width:100%;
+ margin-top:8px
+}
+
 .secondary{background:#263d5b}
-.customer{background:#0c1a2d;border:1px solid #243c5a;padding:14px;border-radius:13px;margin:10px 0}
+
+.customer{
+ background:#0c1a2d;
+ border:1px solid #243c5a;
+ padding:14px;
+ border-radius:13px;
+ margin:10px 0;
+ overflow-wrap:anywhere
+}
+
 .customer h3{margin:0 0 8px}
-.badge{display:inline-block;padding:5px 9px;border-radius:20px;font-size:12px;font-weight:bold}
+
+.badge{
+ display:inline-block;
+ padding:5px 9px;
+ border-radius:20px;
+ font-size:12px;
+ font-weight:bold
+}
+
 .on{background:#075b3b;color:#8fffc0}
 .off{background:#762b3a;color:#ffc0c0}
-.row{display:flex;justify-content:space-between;gap:8px;align-items:center}
-.actions{display:flex;gap:7px;flex-wrap:wrap;margin-top:10px}
-.actions button,.actions a{flex:1;min-width:100px}
-.hidden{display:none}
-.error{color:#ff8585}.success{color:#62e6a0}
-nav{display:grid;grid-template-columns:repeat(4,1fr);gap:7px;margin-bottom:14px}
-nav a{background:#1b304b;color:#d9e9ff;text-decoration:none;text-align:center;padding:12px 4px;border-radius:10px;font-size:12px}
+
+.row{
+ display:flex;
+ justify-content:space-between;
+ gap:8px;
+ align-items:center
+}
+
+nav{
+ display:grid;
+ grid-template-columns:repeat(4,1fr);
+ gap:7px;
+ margin-bottom:14px
+}
+
+nav a{
+ background:#1b304b;
+ color:#d9e9ff;
+ text-decoration:none;
+ text-align:center;
+ padding:12px 4px;
+ border-radius:10px;
+ font-size:12px
+}
+
 nav a:active{background:#1877ed}
-.customer small{color:#9eafc9}
-hr{border:0;border-top:1px solid #304765;margin:14px 0}
-@media(min-width:650px){.grid{grid-template-columns:repeat(4,1fr)}}
+
+hr{
+ border:0;
+ border-top:1px solid #304765;
+ margin:14px 0
+}
+
+.error{color:#ff8585}
+.success{color:#62e6a0}
+
+@media(min-width:650px){
+ .grid{grid-template-columns:repeat(4,1fr)}
+}
 </style>
 </head>
+
 <body>
+
 <header>
  <div class="brand">◈ MANAJEMEN MIKROTIK</div>
- <div class="sub">PANEL MANAJEMEN ISP · {{ selected.name if selected else "Pilih router" }}</div>
+ <div class="sub">
+ PANEL MANAJEMEN ISP ·
+ {{ selected.name if selected else "Pilih router" }}
+ </div>
 </header>
+
 <main>
 
 <nav>
@@ -291,32 +430,78 @@ hr{border:0;border-top:1px solid #304765;margin:14px 0}
 </nav>
 
 <section id="dashboard" class="card">
- <div class="row">
-  <div><b>Dashboard Utama</b><div class="muted">Ringkasan pelanggan PPPoE</div></div>
-  {% if selected %}<span class="badge success">Router dipilih</span>{% endif %}
- </div>
+
+ <h3>Dashboard Utama</h3>
+ <div class="muted">Ringkasan pelanggan PPPoE</div>
+
  {% if selected and not error %}
+
  <div class="grid" style="margin-top:15px">
-  <div class="stat green">● Online<b id="onlineCount">{{ online_count }}</b><small>Aktif sekarang</small></div>
-  <div class="stat red">● Offline<b id="offlineCount">{{ offline_count }}</b><small>Tidak aktif</small></div>
-  <div class="stat blue">♙ Total<b id="totalCount">{{ total_count }}</b><small>Akun PPPoE</small></div>
-  <div class="stat purple">▣ Router<b style="font-size:19px">{{ selected.name }}</b><small>{{ selected.host }}</small></div>
+
+  <a class="stat green"
+     href="/router/{{ router_index }}?view=online#pelanggan">
+   ● ONLINE
+   <b>{{ online_count }}</b>
+   <small>Tekan untuk melihat pelanggan aktif</small>
+  </a>
+
+  <a class="stat red"
+     href="/router/{{ router_index }}?view=offline#pelanggan">
+   ● OFFLINE
+   <b>{{ offline_count }}</b>
+   <small>Tekan untuk melihat pelanggan putus</small>
+  </a>
+
+  <a class="stat blue"
+     href="/router/{{ router_index }}?view=total#pelanggan">
+   ♙ TOTAL
+   <b>{{ total_count }}</b>
+   <small>Semua akun PPPoE</small>
+  </a>
+
+  <div class="stat purple">
+   ▣ ROUTER
+   <b style="font-size:19px">{{ selected.name }}</b>
+   <small>{{ selected.host }}</small>
+  </div>
+
  </div>
- <p class="muted">Pembaruan otomatis setiap 30 detik selama aplikasi terbuka.</p>
- <button class="full" onclick="refreshData()">↻ PERBARUI SEKARANG</button>
+
+ <p class="muted">
+ Pembaruan otomatis setiap 30 detik selama aplikasi terbuka.
+ </p>
+
+ <button class="full" onclick="refreshData()">
+ ↻ PERBARUI SEKARANG
+ </button>
+
  {% elif error %}
+
  <p class="error">Koneksi gagal: {{ error }}</p>
+
  {% else %}
- <p class="muted">Pilih router lalu tekan Hubungkan untuk melihat statistik.</p>
+
+ <p class="muted">
+ Pilih router lalu tekan Hubungkan untuk melihat statistik.
+ </p>
+
  {% endif %}
+
 </section>
+
 
 <section id="router" class="card">
  <h3>Router MikroTik</h3>
+
  {% for router in routers %}
  <div class="customer">
-  <div class="row"><b>{{ router.name }}</b><span class="badge on">Tersimpan</span></div>
+  <div class="row">
+   <b>{{ router.name }}</b>
+   <span class="badge on">Tersimpan</span>
+  </div>
+
   <small>{{ router.host }}:{{ router.port }}</small>
+
   <form method="POST" action="/router/{{ loop.index0 }}">
    <button class="full">HUBUNGKAN & LIHAT DATA</button>
   </form>
@@ -326,92 +511,179 @@ hr{border:0;border-top:1px solid #304765;margin:14px 0}
  {% endfor %}
 </section>
 
+
 <section id="pelanggan" class="card">
- <div class="row"><h3>Daftar Pelanggan</h3><span class="muted" id="lastUpdate"></span></div>
+
+ <div class="row">
+  <h3>Daftar Pelanggan</h3>
+  <span class="muted">{{ view_label }}</span>
+ </div>
+
  {% if selected and not error %}
- <input id="search" placeholder="Cari nama atau IP pelanggan..." oninput="filterCustomers()">
+
+ <input id="search"
+        placeholder="Cari nama, IP, HP atau lokasi..."
+        oninput="filterCustomers()">
+
  <div id="customerList">
+
  {% for c in customers %}
- <div class="customer customer-item" data-search="{{ (c.name ~ ' ' ~ c.address)|lower }}">
+
+ <div class="customer customer-item"
+ data-search="{{ (c.name ~ ' ' ~ c.address ~ ' ' ~ c.phone ~ ' ' ~ c.location)|lower }}">
+
   <div class="row">
    <h3>{{ c.name }}</h3>
-   {% if c.online %}<span class="badge on">ONLINE</span>{% else %}<span class="badge off">OFFLINE</span>{% endif %}
+
+   {% if c.online %}
+    <span class="badge on">ONLINE</span>
+   {% else %}
+    <span class="badge off">OFFLINE</span>
+   {% endif %}
   </div>
+
   <div>IP pelanggan: <b>{{ c.address }}</b></div>
-  <div>Service: {{ c.service }} · Paket: {{ c.profile }}</div>
+  <div>Service: {{ c.service }}</div>
+  <div>Paket: {{ c.profile }}</div>
+
   {% if c.online %}
    <div>Uptime: {{ c.uptime }}</div>
   {% else %}
-   <div class="error">Mulai offline: {{ c.offline_since or "Belum tercatat" }}</div>
-   <div class="error">Lama offline: <b>{{ c.offline_duration }}</b></div>
-  {% endif %}
-  <div class="muted">Caller ID: {{ c.caller_id }}</div>
-  <hr>
-  <form method="POST" action="/customer/{{ router_index }}/{{ c.name }}">
-   <input name="phone" placeholder="Nomor HP pelanggan" value="{{ c.phone }}">
-   <input name="location" placeholder="Alamat / nama lokasi pelanggan" value="{{ c.location }}">
-   <div class="grid">
-    <input name="lat" placeholder="Latitude GPS" value="{{ c.lat }}">
-    <input name="lon" placeholder="Longitude GPS" value="{{ c.lon }}">
+   <div class="error">
+    Mulai offline: {{ c.offline_since or "Belum tercatat" }}
    </div>
-   <button class="full secondary" type="submit">SIMPAN DATA PELANGGAN</button>
-  </form>
-  {% if c.lat and c.lon %}
-   <a class="btn full" style="display:block;margin-top:8px" target="_blank" href="https://www.google.com/maps?q={{ c.lat }},{{ c.lon }}">BUKA LOKASI DI GOOGLE MAPS</a>
-  {% elif c.location %}
-   <a class="btn full" style="display:block;margin-top:8px" target="_blank" href="https://www.google.com/maps/search/?api=1&query={{ c.location|urlencode }}">CARI LOKASI DI GOOGLE MAPS</a>
-  {% else %}
-   <small class="muted">Lokasi belum diisi.</small>
+   <div class="error">
+    Lama offline: <b>{{ c.offline_duration }}</b>
+   </div>
   {% endif %}
+
+  <div class="muted">Caller ID: {{ c.caller_id }}</div>
+
+  <hr>
+
+  <form method="POST" action="/customer/{{ router_index }}">
+   <input type="hidden" name="username" value="{{ c.name }}">
+
+   <input name="phone"
+          placeholder="Nomor HP pelanggan"
+          value="{{ c.phone }}">
+
+   <input name="location"
+          placeholder="Alamat / nama lokasi pelanggan"
+          value="{{ c.location }}">
+
+   <div class="grid">
+    <input name="lat"
+           placeholder="Latitude GPS"
+           value="{{ c.lat }}">
+
+    <input name="lon"
+           placeholder="Longitude GPS"
+           value="{{ c.lon }}">
+   </div>
+
+   <button class="full secondary">
+    SIMPAN DATA PELANGGAN
+   </button>
+  </form>
+
+  {% if c.lat and c.lon %}
+
+   <a class="btn full"
+      target="_blank"
+      href="https://www.google.com/maps?q={{ c.lat }},{{ c.lon }}">
+      BUKA LOKASI DI GOOGLE MAPS
+   </a>
+
+  {% elif c.location %}
+
+   <a class="btn full"
+      target="_blank"
+      href="https://www.google.com/maps/search/?api=1&query={{ c.location|urlencode }}">
+      CARI LOKASI DI GOOGLE MAPS
+   </a>
+
+  {% else %}
+
+   <small class="muted">Lokasi belum diisi.</small>
+
+  {% endif %}
+
  </div>
+
  {% else %}
  <p class="muted">Belum ada pelanggan.</p>
  {% endfor %}
+
  </div>
+
  {% elif error %}
- <p class="error">Data pelanggan belum bisa dimuat karena koneksi gagal.</p>
+
+ <p class="error">Data pelanggan belum bisa dimuat.</p>
+
  {% else %}
+
  <p class="muted">Hubungkan router untuk melihat pelanggan.</p>
+
  {% endif %}
+
 </section>
+
 
 <section id="tambah" class="card">
  <h3>Tambah Router</h3>
+
  <form method="POST" action="/add">
   <input name="name" placeholder="Nama router" required>
   <input name="host" placeholder="IP MikroTik / IP ZeroTier" required>
   <input name="port" type="number" value="8728" required>
   <input name="username" placeholder="Username API" required>
   <input name="password" type="password" placeholder="Password API" required>
+
   <button class="full">SIMPAN ROUTER</button>
  </form>
- <small class="muted">Data router disimpan di penyimpanan internal aplikasi.</small>
+
+ <small class="muted">
+ Data router disimpan di penyimpanan internal aplikasi.
+ </small>
 </section>
 
 </main>
+
 <script>
 const routerIndex = {{ router_index if router_index is not none else "null" }};
 
 function filterCustomers(){
- const q=document.getElementById("search").value.toLowerCase();
+ const input=document.getElementById("search");
+ if(!input)return;
+
+ const q=input.value.toLowerCase();
+
  document.querySelectorAll(".customer-item").forEach(el=>{
-  el.style.display=el.dataset.search.includes(q)?"block":"none";
+  el.style.display=
+   el.dataset.search.includes(q) ? "block" : "none";
  });
 }
 
 async function refreshData(){
  if(routerIndex===null)return;
+
  try{
-  const response=await fetch("/api/router/"+routerIndex+"/refresh");
+  const response=await fetch(
+   "/api/router/"+routerIndex+"/refresh"
+  );
+
   const data=await response.json();
-  if(!response.ok||data.error)throw new Error(data.error||"Gagal memperbarui");
-  document.getElementById("onlineCount").textContent=data.online;
-  document.getElementById("offlineCount").textContent=data.offline;
-  document.getElementById("totalCount").textContent=data.total;
-  document.getElementById("lastUpdate").textContent="Baru diperbarui";
+
+  if(!response.ok || data.error){
+   throw new Error(data.error || "Gagal memperbarui");
+  }
+
   location.reload();
+
  }catch(e){
-  document.getElementById("lastUpdate").textContent="Gagal memperbarui";
+  const label=document.getElementById("lastUpdate");
+  if(label)label.textContent="Gagal memperbarui";
  }
 }
 
@@ -419,12 +691,13 @@ if(routerIndex!==null){
  setInterval(refreshData,30000);
 }
 </script>
+
 </body>
 </html>
 """
 
 
-def render_dashboard(router_index=None, error=None):
+def render_dashboard(router_index=None, view="all", error=None):
     routers = load_routers()
     selected = None
     customers = []
@@ -436,12 +709,30 @@ def render_dashboard(router_index=None, error=None):
 
         if not error:
             active, secrets, fetch_error = fetch_router_data(selected)
+
             if fetch_error:
                 error = fetch_error
             else:
                 customers = build_customers(selected, active, secrets)
-                online_count = sum(1 for c in customers if c["online"])
+
+                online_count = sum(
+                    1 for c in customers if c["online"]
+                )
+
                 offline_count = len(customers) - online_count
+
+                if view == "online":
+                    customers = [c for c in customers if c["online"]]
+
+                elif view == "offline":
+                    customers = [c for c in customers if not c["online"]]
+
+    labels = {
+        "all": "Semua pelanggan",
+        "online": "Pelanggan online",
+        "offline": "Pelanggan offline",
+        "total": "Semua akun PPPoE"
+    }
 
     return render_template_string(
         PAGE,
@@ -451,8 +742,9 @@ def render_dashboard(router_index=None, error=None):
         error=error,
         online_count=online_count,
         offline_count=offline_count,
-        total_count=len(customers),
-        router_index=router_index
+        total_count=online_count + offline_count,
+        router_index=router_index,
+        view_label=labels.get(view, "Semua pelanggan")
     )
 
 
@@ -473,11 +765,17 @@ def add_router():
         "password": request.form.get("password", "")
     }
 
-    if not all([router["name"], router["host"], router["username"], router["password"]]):
+    if not all([
+        router["name"],
+        router["host"],
+        router["username"],
+        router["password"]
+    ]):
         return "Semua data router wajib diisi.", 400
 
     routers.append(router)
     save_routers(routers)
+
     return redirect("/")
 
 
@@ -488,15 +786,25 @@ def router_detail(index):
     if index < 0 or index >= len(routers):
         return "Router tidak ditemukan.", 404
 
-    return render_dashboard(index)
+    view = request.args.get("view", "all")
+
+    if view not in ("all", "online", "offline", "total"):
+        view = "all"
+
+    return render_dashboard(index, view)
 
 
-@app.route("/customer/<int:index>/<path:username>", methods=["POST"])
-def save_customer(index, username):
+@app.route("/customer/<int:index>", methods=["POST"])
+def save_customer(index):
     routers = load_routers()
 
     if index < 0 or index >= len(routers):
         return "Router tidak ditemukan.", 404
+
+    username = request.form.get("username", "").strip()
+
+    if not username:
+        return "Username tidak ditemukan.", 400
 
     data = load_customer_data()
     key = customer_key(routers[index], username)
@@ -509,7 +817,8 @@ def save_customer(index, username):
     }
 
     save_customer_data(data)
-    return redirect(f"/router/{index}#pelanggan")
+
+    return redirect("/router/" + str(index) + "?view=all#pelanggan")
 
 
 @app.route("/api/router/<int:index>/refresh")
@@ -547,7 +856,9 @@ def start_server(data_dir=None):
         setup_storage(data_dir)
 
         try:
-            test = socket.create_connection(("127.0.0.1", 8765), timeout=0.5)
+            test = socket.create_connection(
+                ("127.0.0.1", 8765), timeout=0.5
+            )
             test.close()
             return "Server sudah berjalan."
         except OSError:
@@ -568,10 +879,14 @@ def start_server(data_dir=None):
 
     for attempt in range(40):
         try:
-            test = socket.create_connection(("127.0.0.1", 8765), timeout=0.5)
+            test = socket.create_connection(
+                ("127.0.0.1", 8765), timeout=0.5
+            )
             test.close()
             return "Server siap."
         except OSError:
             time.sleep(0.25)
 
-    raise RuntimeError("Server tidak berhasil dijalankan pada port 8765.")
+    raise RuntimeError(
+        "Server tidak berhasil dijalankan pada port 8765."
+    )
