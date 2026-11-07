@@ -1,45 +1,48 @@
+plugins {
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
+    id("com.chaquo.python")
+}
 
-name: Build Android APK
+android {
+    namespace = "id.manajemen.mikrotik"
+    compileSdk = 35
 
-on:
-  workflow_dispatch:
-  push:
-    branches:
-      - main
+    defaultConfig {
+        applicationId = "id.manajemen.mikrotik"
+        minSdk = 26
+        targetSdk = 35
+        versionCode = 1
+        versionName = "1.0"
 
-permissions:
-  contents: read
+        ndk {
+            abiFilters += listOf("arm64-v8a", "x86_64")
+        }
+    }
 
-jobs:
-  build:
-    runs-on: ubuntu-latest
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
 
-    steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
+    kotlinOptions {
+        jvmTarget = "17"
+    }
 
-      - name: Setup Java
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
+    buildTypes {
+        release {
+            isMinifyEnabled = false
+        }
+    }
+}
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-        with:
-          packages: 'platform-tools'
+chaquopy {
+    defaultConfig {
+        version = "3.13"
 
-      - name: Setup Gradle 8.9
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: '8.9'
-
-      - name: Build APK
-        run: gradle assembleDebug
-
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: Manajemen-MikroTik
-          path: app/build/outputs/apk/debug/app-debug.apk
-          if-no-files-found: error
+        pip {
+            install("Flask==3.1.3")
+            install("RouterOS-api==0.21.0")
+        }
+    }
+}
