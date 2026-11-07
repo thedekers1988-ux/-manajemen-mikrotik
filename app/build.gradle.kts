@@ -1,4 +1,3 @@
-
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -40,6 +39,7 @@ android {
 chaquopy {
     defaultConfig {
         version = "3.13"
+
         pip {
             install("Flask==3.1.3")
             install("RouterOS-api==0.21.0")
