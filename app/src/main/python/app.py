@@ -305,16 +305,38 @@ def router_detail(index):
         selected=router["name"]
     )
 
+_server_thread = None
 
 def start_server(data_dir=None):
-    global DATA_DIR, DB
+    global DATA_DIR, DB, _server_thread
 
-    # Gunakan folder penyimpanan internal Android
     if data_dir:
         DATA_DIR = Path(data_dir)
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         DB = DATA_DIR / "routers.json"
 
+    if _server_thread is not None and _server_thread.is_alive():
+        return "already-running"
+
+    def run_server():
+        app.run(
+            host="127.0.0.1",
+            port=8765,
+            debug=False,
+            use_reloader=False,
+            threaded=True
+        )
+
+    _server_thread = threading.Thread(
+        target=run_server,
+        daemon=True
+    )
+    _server_thread.start()
+
+    return "starting"
+
+
+if __name__ == "__main__":
     app.run(
         host="127.0.0.1",
         port=8765,
@@ -323,6 +345,3 @@ def start_server(data_dir=None):
         threaded=True
     )
 
-
-if __name__ == "__main__":
-    start_server()
