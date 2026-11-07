@@ -10,15 +10,10 @@ import time
 
 app = Flask(__name__)
 
-DATA_DIR = Path(
-    os.environ.get(
-        "MIKROTIK_DATA_DIR",
-        str(Path(__file__).resolve().parent)
-    )
-)
+DATA_DIR = Path(__file__).resolve().parent
 DB = DATA_DIR / "routers.json"
-
 _server_thread = None
+_server_lock = threading.Lock()
 
 
 def setup_storage(data_dir=None):
@@ -42,21 +37,22 @@ def load_routers():
 
 def save_routers(routers):
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+
     with open(DB, "w", encoding="utf-8") as f:
         json.dump(routers, f, indent=2)
 
 
 def connect_router(router):
-    return RouterOsApiPool(
+    pool = RouterOsApiPool(
         router["host"],
         username=router["username"],
         password=router["password"],
         port=int(router.get("port", 8728)),
         plaintext_login=True,
         use_ssl=False,
-        ssl_verify=False,
-        timeout=8
+        ssl_verify=False
     )
+    return pool
 
 
 PAGE = """
@@ -64,76 +60,132 @@ PAGE = """
 <html lang="id">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Manajemen MikroTik</title>
 <style>
-*{box-sizing:border-box}
-body{margin:0;background:#0b1220;color:#edf3ff;font-family:Arial}
-header{padding:22px;background:#111d30;border-bottom:1px solid #263b59}
-main{max-width:850px;margin:auto;padding:16px}
-.card{background:#142238;border:1px solid #29415f;border-radius:14px;padding:17px;margin-bottom:15px}
-input,button{width:100%;padding:13px;margin:6px 0;border-radius:8px;border:1px solid #405574;background:#0c1728;color:white}
-button{background:#1677ee;border:0;font-weight:bold}
-.online{color:#42df91}
-.error{color:#ff7979;overflow-wrap:anywhere}
-.small{color:#9aabc5;font-size:13px}
-table{width:100%;border-collapse:collapse}
-td,th{text-align:left;padding:10px;border-bottom:1px solid #344761}
-a{text-decoration:none}
+* { box-sizing: border-box; }
+body {
+    margin: 0;
+    background: #0b1220;
+    color: #edf3ff;
+    font-family: Arial, sans-serif;
+}
+header {
+    padding: 22px;
+    background: #111d30;
+    border-bottom: 1px solid #263b59;
+    font-size: 24px;
+    font-weight: bold;
+}
+main {
+    max-width: 850px;
+    margin: auto;
+    padding: 16px;
+}
+.card {
+    background: #14243a;
+    border: 1px solid #304765;
+    border-radius: 18px;
+    padding: 22px;
+    margin-bottom: 18px;
+}
+h2 { margin-top: 0; }
+input, button {
+    width: 100%;
+    padding: 14px;
+    margin: 6px 0;
+    border-radius: 10px;
+    font-size: 16px;
+}
+input {
+    background: #0b1728;
+    color: white;
+    border: 1px solid #405574;
+}
+button {
+    background: #1877ed;
+    color: white;
+    border: 0;
+    font-weight: bold;
+    cursor: pointer;
+}
+.router {
+    border-top: 1px solid #405574;
+    padding-top: 15px;
+    margin-top: 15px;
+}
+.error { color: #ff8585; }
+.success { color: #62e6a0; }
+.customer {
+    background: #0c1a2d;
+    padding: 12px;
+    border-radius: 10px;
+    margin: 8px 0;
+    overflow-wrap: anywhere;
+}
+.small { color: #9eafc9; font-size: 14px; }
 </style>
 </head>
 <body>
-<header>
-<h2>⚡ MANAJEMEN MIKROTIK</h2>
-<div class="small">Monitoring Router dan Pelanggan PPPoE</div>
-</header>
+<header>MANAJEMEN MIKROTIK</header>
 <main>
 
 <div class="card">
-<h3>Tambah Router</h3>
-<form method="post" action="/add">
-<input name="name" placeholder="Nama router" required>
+<h2>Tambah Router MikroTik</h2>
+
+<form method="POST" action="/add">
+<input name="name" placeholder="Nama Router" required>
 <input name="host" placeholder="IP MikroTik / IP ZeroTier" required>
-<input name="port" type="number" value="8728" required>
+<input name="port" type="number" value="8728" placeholder="Port API" required>
 <input name="username" placeholder="Username API" required>
 <input name="password" type="password" placeholder="Password API" required>
 <button type="submit">SIMPAN ROUTER</button>
 </form>
+
 <p class="small">Data disimpan di penyimpanan internal aplikasi.</p>
 </div>
 
-{% for r in routers %}
 <div class="card">
-<h3>{{ r.name }}</h3>
-<p>Alamat: {{ r.host }}:{{ r.port }}</p>
-<a href="/router/{{ loop.index0 }}">
-<button>HUBUNGKAN & LIHAT PPPoE</button>
-</a>
+<h2>Daftar Router</h2>
+
+{% if routers %}
+    {% for router in routers %}
+    <div class="router">
+        <h2>{{ router.name }}</h2>
+        <p>Alamat: {{ router.host }}:{{ router.port }}</p>
+
+        <form method="POST" action="/router/{{ loop.index0 }}">
+            <button type="submit">HUBUNGKAN & LIHAT PPPoE</button>
+        </form>
+    </div>
+    {% endfor %}
+{% else %}
+<p>Belum ada router. Silakan tambahkan router.</p>
+{% endif %}
 </div>
-{% endfor %}
 
 {% if selected %}
 <div class="card">
-<h3>Hasil Koneksi: {{ selected }}</h3>
+<h2>Hasil Koneksi: {{ selected.name }}</h2>
 
 {% if error %}
 <p class="error">● Koneksi gagal</p>
 <p class="error">{{ error }}</p>
 {% else %}
-<p class="online">● Terhubung ke MikroTik</p>
-<p>Total PPPoE aktif: <b>{{ result|length }}</b></p>
-<div style="overflow-x:auto">
-<table>
-<tr><th>Username</th><th>IP Address</th><th>Uptime</th></tr>
-{% for c in result %}
-<tr>
-<td>{{ c.get('name','-') }}</td>
-<td>{{ c.get('address','-') }}</td>
-<td>{{ c.get('uptime','-') }}</td>
-</tr>
-{% endfor %}
-</table>
+<p class="success">● Koneksi berhasil</p>
+<h3>PPPoE Aktif: {{ customers|length }}</h3>
+
+{% for customer in customers %}
+<div class="customer">
+<strong>{{ customer.name or "Tanpa nama" }}</strong><br>
+IP: {{ customer.address or "-" }}<br>
+Service: {{ customer.service or "-" }}<br>
+Uptime: {{ customer.uptime or "-" }}<br>
+Caller ID: {{ customer["caller-id"] or "-" }}
 </div>
+{% else %}
+<p>Belum ada pelanggan PPPoE aktif.</p>
+{% endfor %}
 {% endif %}
 </div>
 {% endif %}
@@ -144,57 +196,61 @@ a{text-decoration:none}
 """
 
 
-@app.route("/")
-def home():
+@app.route("/", methods=["GET"])
+def index():
     return render_template_string(
         PAGE,
         routers=load_routers(),
-        result=None,
-        error=None,
-        selected=""
+        selected=None,
+        customers=[],
+        error=None
     )
 
 
 @app.route("/add", methods=["POST"])
 def add_router():
-    try:
-        routers = load_routers()
-        routers.append({
-            "name": request.form["name"].strip(),
-            "host": request.form["host"].strip(),
-            "port": int(request.form["port"]),
-            "username": request.form["username"].strip(),
-            "password": request.form["password"]
-        })
-        save_routers(routers)
-        return redirect("/")
-    except Exception as e:
-        return "Gagal menyimpan router: " + str(e), 500
+    routers = load_routers()
+
+    router = {
+        "name": request.form.get("name", "").strip(),
+        "host": request.form.get("host", "").strip(),
+        "port": request.form.get("port", "8728").strip(),
+        "username": request.form.get("username", "").strip(),
+        "password": request.form.get("password", "")
+    }
+
+    if not all([
+        router["name"],
+        router["host"],
+        router["username"],
+        router["password"]
+    ]):
+        return "Semua data router wajib diisi.", 400
+
+    routers.append(router)
+    save_routers(routers)
+
+    return redirect("/")
 
 
-@app.route("/router/<int:index>")
+@app.route("/router/<int:index>", methods=["POST"])
 def router_detail(index):
     routers = load_routers()
 
     if index < 0 or index >= len(routers):
-        return "Router tidak ditemukan", 404
+        return "Router tidak ditemukan.", 404
 
-    router = routers[index]
-    pool = None
-    result = []
+    selected = routers[index]
+    customers = []
     error = None
+    pool = None
 
     try:
-        # Periksa apakah alamat dan port dapat dijangkau
-        test_socket = socket.create_connection(
-            (router["host"], int(router.get("port", 8728))),
-            timeout=8
-        )
-        test_socket.close()
-
-        pool = connect_router(router)
+        pool = connect_router(selected)
         api = pool.get_api()
-        result = api.get_resource("/ppp/active").get()
+
+        resource = api.get_resource("/ppp/active")
+        customers = resource.get()
 
     except Exception as e:
         error = str(e)
@@ -209,52 +265,57 @@ def router_detail(index):
     return render_template_string(
         PAGE,
         routers=routers,
-        result=result,
-        error=error,
-        selected=router["name"]
+        selected=selected,
+        customers=customers,
+        error=error
     )
 
 
-@app.route("/health")
+@app.route("/health", methods=["GET"])
 def health():
-    return "OK - Manajemen MikroTik berjalan"
+    return {"status": "ok"}
 
 
 def start_server(data_dir=None):
     global _server_thread
 
-    setup_storage(data_dir)
+    with _server_lock:
+        setup_storage(data_dir)
 
-    if _server_thread and _server_thread.is_alive():
-        return "already-running"
-
-    def run_server():
-        app.run(
-            host="127.0.0.1",
-            port=8765,
-            debug=False,
-            use_reloader=False,
-            threaded=True
-        )
-
-    _server_thread = threading.Thread(
-        target=run_server,
-        daemon=True
-    )
-    _server_thread.start()
-
-    # Tunggu sampai server lokal siap
-    for _ in range(50):
         try:
-            with socket.create_connection(
-                ("127.0.0.1", 8765), timeout=0.3
-            ):
-                return "ready"
+            test = socket.create_connection(
+                ("127.0.0.1", 8765),
+                timeout=0.5
+            )
+            test.close()
+            return "Server sudah berjalan."
         except OSError:
-            time.sleep(0.2)
+            pass
 
-    raise RuntimeError("Server lokal gagal dimulai")
+        if _server_thread and _server_thread.is_alive():
+            pass
+        else:
+            _server_thread = threading.Thread(
+                target=lambda: app.run(
+                    host="127.0.0.1",
+                    port=8765,
+                    debug=False,
+                    use_reloader=False,
+                    threaded=True
+                ),
+                daemon=True
+            )
+            _server_thread.start()
 
+    for attempt in range(40):
+        try:
+            test = socket.create_connection(
+                ("127.0.0.1", 8765),
+                timeout=0.5
+            )
+            test.close()
+            return "Server siap."
+        except OSError:
+            time.sleep(0.25)
 
-if __name__ == "__main__":
-    start_server()
+    raise RuntimeError("Server tidak berhasil dijalankan pada port 8765.")
