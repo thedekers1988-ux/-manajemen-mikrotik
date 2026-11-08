@@ -1214,15 +1214,10 @@ def router_page():
 
             </form>
 
-            <form method="post"
-            action="/router-delete/{{loop.index0}}"
-            onsubmit="return confirm('Hapus router ini dari aplikasi? Data pelanggan lokal dan riwayat monitoring milik router ini juga akan dihapus. Konfigurasi di perangkat MikroTik tidak berubah.');">
-
-                <button class="btn btn-red" type="submit">
-                    Hapus Router
-                </button>
-
-            </form>
+            <a class="btn btn-red"
+            href="/router-delete-confirm/{{loop.index0}}">
+                Hapus Router
+            </a>
 
         </div>
 
@@ -1234,6 +1229,40 @@ def router_page():
     """
 
     return page(content, items=data)
+
+
+@app.route("/router-delete-confirm/<int:index>", methods=["GET"])
+def router_delete_confirm(index):
+    routers = get_routers()
+
+    if index < 0 or index >= len(routers):
+        flash("Router tidak ditemukan.")
+        return redirect("/routers")
+
+    router = routers[index]
+    content = """
+    <div class="card">
+        <h3>Konfirmasi Hapus Router</h3>
+        <p>Apakah kamu yakin ingin menghapus router berikut dari aplikasi?</p>
+        <h3>{{name}}</h3>
+        <p>{{host}}:{{port}}</p>
+        <p class="small">
+            Data pelanggan lokal dan riwayat monitoring milik router ini
+            juga akan dihapus. Konfigurasi pada perangkat MikroTik tidak berubah.
+        </p>
+        <form method="post" action="/router-delete/{{index}}">
+            <button class="btn btn-red" type="submit">Ya, Hapus Router</button>
+            <a class="btn" href="/routers">Batal</a>
+        </form>
+    </div>
+    """
+    return page(
+        content,
+        name=router.get("name", "MikroTik"),
+        host=router.get("host", ""),
+        port=router.get("port", "8728"),
+        index=index
+    )
 
 
 @app.route("/router-delete/<int:index>", methods=["POST"])
