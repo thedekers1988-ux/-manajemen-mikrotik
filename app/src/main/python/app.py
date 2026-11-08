@@ -1,70 +1,122 @@
+
 import os
 import json
 import time
 import threading
 from datetime import datetime
-from flask import Flask, request, redirect, url_for, render_template_string, flash
+from flask import (
+    Flask, request, redirect, render_template_string,
+    flash, url_for
+)
 from routeros_api import RouterOsApiPool
 
 app = Flask(__name__)
-app.secret_key = "mikrotik-management-local-key"
+app.secret_key = "manajemen-mikrotik-local"
+
+# ==================================================
+# PENYIMPANAN DATA
+# ==================================================
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
-if not os.path.exists(DATA_DIR):
-    os.makedirs(DATA_DIR)
-
 ROUTERS_FILE = os.path.join(DATA_DIR, "routers.json")
 CUSTOMERS_FILE = os.path.join(DATA_DIR, "customers.json")
 STATE_FILE = os.path.join(DATA_DIR, "state.json")
 
+os.makedirs(DATA_DIR, exist_ok=True)
+
+
 def read_json(path, default):
     try:
-        with open(path, "r") as f:
+        with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return default
 
+
 def write_json(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     temp = path + ".tmp"
-    with open(temp, "w") as f:
-        json.dump(data, f, indent=2)
+    with open(temp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
     os.replace(temp, path)
 
-def routers():
+
+def get_routers():
     return read_json(ROUTERS_FILE, [])
 
-def customers():
+
+def get_customers():
     return read_json(CUSTOMERS_FILE, [])
 
-def states():
+
+def get_states():
     return read_json(STATE_FILE, {})
+
 
 def save_customers(data):
     write_json(CUSTOMERS_FILE, data)
 
+
 def save_states(data):
     write_json(STATE_FILE, data)
 
-def connect_router(router):
-    pool = RouterOsApiPool(
-        router["host"],
-        username=router["username"],
-        password=router["password"],
-        port=int(router.get("port", 8728)),
-        plaintext_login=True
-    )
-    return pool
+
+# ==================================================
+# FORMAT DATA
+# ==================================================
+
+def format_time(value):
+    if not value:
+        return "Belum tercatat"
+    try:
+        return datetime.fromtimestamp(float(value)).strftime(
+            "%d-%m-%Y %H:%M:%S"
+        )
+    except Exception:
+        return "-"
+
+
+def format_bytes(value):
+    value = float(value or 0)
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if value < 1024:
+            return "%.2f %s" % (value, unit)
+        value /= 1024
+    return "%.2f PB" % value
+
+
+app.jinja_env.filters["datetime"] = format_time
+app.jinja_env.filters["bytes"] = format_bytes
+
+
+# ==================================================
+# KONEKSI MIKROTIK
+# ==================================================
 
 def fetch_router(router):
     pool = None
+
     try:
-        pool = connect_router(router)
+        pool = RouterOsApiPool(
+            router["host"],
+            username=router["username"],
+            password=router["password"],
+            port=int(router.get("port", 8728)),
+            plaintext_login=True,
+            use_ssl=False,
+            timeout=8
+        )
+
         api = pool.get_api()
+
         active = api.get_resource("/ppp/active").get()
         secrets = api.get_resource("/ppp/secret").get()
+
         return active, secrets, "Terhubung"
+
     except Exception as e:
         return [], [], "Gagal: " + str(e)
+
     finally:
         if pool:
             try:
@@ -72,51 +124,78 @@ def fetch_router(router):
             except Exception:
                 pass
 
+
+# ==================================================
+# MONITORING PPPoE
+# ==================================================
+
 def update_monitor():
-    """Mencatat perubahan status dan penghitung trafik saat aplikasi dibuka."""
-    all_routers = routers()
-    all_customers = customers()
-    state = states()
+    all_routers = get_routers()
+    all_customers = get_customers()
+    state = get_states()
+
     now = time.time()
+    month_key = datetime.now().strftime("%Y-%m")
 
-    for index, router in enumerate(all_routers):
+    for router_index, router in enumerate(all_routers):
+        rid = str(router_index)
+
         active, secret_list, status = fetch_router(router)
-        router_id = str(index)
 
-        state.setdefault(router_id, {})
-        state[router_id]["router_status"] = status
+        if rid not in state:
+            state[rid] = {}
+
+        state[rid]["router_status"] = status
 
         active_by_name = {
-            item.get("name"): item for item in active
+            item.get("name"): item
+            for item in active
+            if item.get("name")
         }
 
         for secret in secret_list:
-            username = secret.get("name", "")
+            username = secret.get("name", "").strip()
+
             if not username:
                 continue
 
-            key = router_id + ":" + username
-            old = state[router_id].get(username, {})
-            current = username in active_by_name
+            old = state[rid].get(username, {})
+            is_online = username in active_by_name
 
-            if current and not old.get("online", False):
-                old["online_since"] = now
+            # Waktu online/offline
+            if is_online:
+                if not old.get("online", False):
+                    old["online_since"] = now
+
                 old["offline_since"] = None
 
-            if not current and old.get("online", False):
-                old["offline_since"] = now
+            else:
+                if old.get("online", False):
+                    old["offline_since"] = now
 
-            old["online"] = current
+                elif not old.get("offline_since"):
+                    # Waktu pertama kali aplikasi menemukan pelanggan offline.
+                    old["offline_since"] = now
 
-            if current:
+            old["online"] = is_online
+
+            # Penghitung bandwidth bulanan
+            if old.get("month_key") != month_key:
+                old["month_rx"] = 0
+                old["month_tx"] = 0
+                old["month_key"] = month_key
+                old["traffic"] = {"rx": 0, "tx": 0}
+
+            if is_online:
                 session = active_by_name[username]
+
                 rx = int(session.get("bytes-in", 0) or 0)
                 tx = int(session.get("bytes-out", 0) or 0)
+
                 previous = old.get("traffic", {})
                 old_rx = int(previous.get("rx", 0))
                 old_tx = int(previous.get("tx", 0))
 
-                # Tambahkan selisih trafik, termasuk jika sesi PPPoE tersambung ulang.
                 if rx >= old_rx:
                     old["month_rx"] = int(old.get("month_rx", 0)) + rx - old_rx
                 else:
@@ -130,58 +209,79 @@ def update_monitor():
                 old["traffic"] = {"rx": rx, "tx": tx}
                 old["last_seen"] = now
 
-            state[router_id][username] = old
+            state[rid][username] = old
 
-            found = next(
-                (c for c in all_customers
-                 if c.get("router") == router_id and c.get("username") == username),
-                None
-            )
+            # Cari data pelanggan yang sudah tersimpan
+            found = None
+
+            for customer in all_customers:
+                if (
+                    str(customer.get("router", "0")) == rid
+                    and customer.get("username") == username
+                ):
+                    found = customer
+                    break
+
+            ip_address = ""
+            if is_online:
+                ip_address = active_by_name[username].get("address", "")
 
             if found:
-                found["ip"] = active_by_name.get(username, {}).get("address", found.get("ip", ""))
+                found["ip"] = ip_address or found.get("ip", "")
                 found["profile"] = secret.get("profile", "")
-                found["online"] = current
+                found["online"] = is_online
+
             else:
                 all_customers.append({
-                    "router": router_id,
+                    "router": rid,
                     "username": username,
-                    "ip": active_by_name.get(username, {}).get("address", ""),
+                    "password": "",
                     "profile": secret.get("profile", ""),
+                    "ip": ip_address,
                     "phone": "",
                     "coordinates": "",
                     "payment": "Belum Lunas",
-                    "online": current
+                    "online": is_online
                 })
 
-    save_states(state)
     save_customers(all_customers)
-    write_json(ROUTERS_FILE, all_routers)
+    save_states(state)
 
-def get_data():
+
+def get_monitor_data():
     update_monitor()
-    all_customers = customers()
-    state = states()
-    all_routers = routers()
+
+    all_customers = get_customers()
+    state = get_states()
 
     online = []
     offline = []
-    for c in all_customers:
-        rid = str(c.get("router", "0"))
-        username = c.get("username", "")
+
+    for customer_index, customer in enumerate(all_customers):
+        item = dict(customer)
+
+        rid = str(item.get("router", "0"))
+        username = item.get("username", "")
+
         info = state.get(rid, {}).get(username, {})
-        item = dict(c)
+
+        item["index"] = customer_index
         item["online"] = bool(info.get("online", False))
         item["offline_time"] = info.get("offline_since")
-        item["month_rx"] = info.get("month_rx", 0)
-        item["month_tx"] = info.get("month_tx", 0)
+        item["month_rx"] = int(info.get("month_rx", 0))
+        item["month_tx"] = int(info.get("month_tx", 0))
 
         if item["online"]:
             online.append(item)
         else:
             offline.append(item)
 
-    return all_customers, online, offline, all_routers
+    return all_customers, online, offline
+
+
+# ==================================================
+# TAMPILAN UTAMA
+# ==================================================
 
 BASE = """
 <!DOCTYPE html>
@@ -189,178 +289,492 @@ BASE = """
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+
 <title>Manajemen MikroTik</title>
+
 <style>
-*{box-sizing:border-box}
-body{margin:0;background:#031329;color:#f1f7ff;font-family:Arial,sans-serif}
-header{background:#082b58;padding:20px 16px;border-bottom:2px solid #087cff}
-header h2{margin:0;color:white}
-header small{color:#a9cfff}
-main{padding:14px;max-width:1000px;margin:auto;padding-bottom:35px}
-nav{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:16px}
-nav a,.btn{background:#0757a7;color:white;padding:11px 13px;border-radius:10px;text-decoration:none;border:0;display:inline-block}
-.card{background:#092447;border:1px solid #15558b;border-radius:14px;padding:15px;margin-bottom:13px}
-.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}
-.stat{font-size:28px;font-weight:bold;margin-top:8px}
-.green{color:#32e99b}.red{color:#ff647c}.blue{color:#62baff}
-input,select{width:100%;padding:12px;margin:6px 0 12px;border-radius:8px;border:1px solid #3278b6;background:#061a34;color:white}
-label{color:#bcdcff;font-size:14px}
-button{cursor:pointer}
-table{width:100%;border-collapse:collapse}
-td,th{text-align:left;padding:11px 6px;border-bottom:1px solid #1b426b;font-size:14px}
-.small{font-size:12px;color:#a9c6e5}
-.badge{padding:5px 8px;border-radius:20px;background:#087b55;color:white;font-size:12px}
-.badge.red{background:#a82043;color:white}
-.btn-green{background:#008d54}
-.btn-red{background:#a82043}
-a{color:#8bcaff}
-h3{margin-top:0}
-@media(max-width:480px){.grid{grid-template-columns:1fr 1fr}td,th{font-size:12px;padding:8px 3px}}
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    background: #031329;
+    color: #f1f7ff;
+    font-family: Arial, sans-serif;
+}
+
+header {
+    background: #082b58;
+    padding: 22px 16px;
+    border-bottom: 3px solid #087cff;
+}
+
+header h2 {
+    margin: 0;
+    font-size: 24px;
+}
+
+header small {
+    color: #a9cfff;
+}
+
+main {
+    padding: 15px;
+    max-width: 900px;
+    margin: auto;
+    padding-bottom: 40px;
+}
+
+.card {
+    display: block;
+    background: #092447;
+    border: 1px solid #205789;
+    border-radius: 17px;
+    padding: 17px;
+    margin-bottom: 14px;
+    color: #f1f7ff;
+}
+
+.grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
+}
+
+.menu-card {
+    text-decoration: none;
+    text-align: center;
+    font-size: 17px;
+    font-weight: bold;
+    padding: 22px 8px;
+    background: #0757a7;
+    border-radius: 13px;
+    color: white;
+}
+
+.menu-card:active {
+    background: #087cff;
+}
+
+.stat {
+    font-size: 32px;
+    font-weight: bold;
+    margin: 8px 0;
+}
+
+.green {
+    color: #32e99b;
+}
+
+.red {
+    color: #ff647c;
+}
+
+.blue {
+    color: #62baff;
+}
+
+.btn {
+    display: inline-block;
+    padding: 12px 16px;
+    margin: 5px 3px 5px 0;
+    background: #0757a7;
+    color: white;
+    border: 0;
+    border-radius: 10px;
+    text-decoration: none;
+    font-size: 15px;
+}
+
+.btn-green {
+    background: #008d54;
+}
+
+.btn-red {
+    background: #a82043;
+}
+
+.back {
+    display: inline-block;
+    margin-bottom: 15px;
+    padding: 12px 16px;
+    background: #0757a7;
+    border-radius: 10px;
+    color: white;
+    text-decoration: none;
+}
+
+input, select {
+    width: 100%;
+    padding: 13px;
+    margin: 7px 0 14px;
+    border-radius: 9px;
+    border: 1px solid #3278b6;
+    background: #061a34;
+    color: white;
+    font-size: 15px;
+}
+
+label {
+    color: #bcdcff;
+    font-size: 14px;
+}
+
+.badge {
+    display: inline-block;
+    padding: 6px 10px;
+    border-radius: 20px;
+    background: #087b55;
+    color: white;
+    font-size: 12px;
+}
+
+.badge.red {
+    background: #a82043;
+}
+
+a {
+    color: #8bcaff;
+}
+
+h3 {
+    margin-top: 0;
+}
+
+.small {
+    font-size: 12px;
+    color: #a9c6e5;
+}
+
+hr {
+    border: 0;
+    border-top: 1px solid #205789;
+    margin: 14px 0;
+}
+
+@media(max-width: 420px) {
+    .menu-card {
+        font-size: 15px;
+        padding: 19px 5px;
+    }
+
+    .stat {
+        font-size: 27px;
+    }
+}
 </style>
 </head>
+
 <body>
+
 <header>
-<h2>◉ Manajemen MikroTik</h2>
-<small>Panel Monitoring ISP</small>
+    <h2>◉ Manajemen MikroTik</h2>
+    <small>Panel Monitoring ISP</small>
 </header>
+
 <main>
-<nav>
-<a href="/">Beranda</a>
-<a href="/online">Online</a>
-<a href="/offline">Offline</a>
-<a href="/pppoe">PPPoE</a>
-<a href="/edit">Edit Pelanggan</a>
-<a href="/detail">Detail Pelanggan</a>
-<a href="/bandwidth">Laporan Bandwidth</a>
-<a href="/routers">Router</a>
-</nav>
+
+{% if request.path != '/' %}
+    <a class="back" href="/">← Kembali ke Menu</a>
+{% endif %}
+
 {% with messages = get_flashed_messages() %}
-{% for message in messages %}
-<div class="card">{{message}}</div>
-{% endfor %}
+    {% for message in messages %}
+        <div class="card">{{ message }}</div>
+    {% endfor %}
 {% endwith %}
+
 {{ content|safe }}
+
 </main>
 </body>
 </html>
 """
 
+
 def page(content, **kwargs):
-    return render_template_string(BASE, content=render_template_string(content, **kwargs))
+    return render_template_string(
+        BASE,
+        content=render_template_string(content, **kwargs)
+    )
+
+
+# ==================================================
+# BERANDA
+# ==================================================
 
 @app.route("/")
 def home():
     try:
-        all_data, online, offline, all_routers = get_data()
+        all_data, online, offline = get_monitor_data()
     except Exception:
-        all_data, online, offline, all_routers = customers(), [], [], routers()
+        all_data = get_customers()
+        online = []
+        offline = all_data
 
-    paid = sum(1 for c in all_data if c.get("payment") == "Lunas")
+    paid = sum(
+        1 for c in all_data
+        if c.get("payment") == "Lunas"
+    )
+
     unpaid = len(all_data) - paid
 
     content = """
     <div class="grid">
-      <a class="card" href="/online"><span class="green">ONLINE</span><div class="stat">{{on}}</div>Lihat pelanggan online →</a>
-      <a class="card" href="/offline"><span class="red">OFFLINE</span><div class="stat">{{off}}</div>Lihat pelanggan offline →</a>
+
+        <a href="/online" class="card" style="text-decoration:none">
+            <span class="green">ONLINE</span>
+            <div class="stat">{{ on }}</div>
+            Lihat pelanggan online →
+        </a>
+
+        <a href="/offline" class="card" style="text-decoration:none">
+            <span class="red">OFFLINE</span>
+            <div class="stat">{{ off }}</div>
+            Lihat pelanggan offline →
+        </a>
+
     </div>
-    <a class="card" href="/pppoe" style="display:block;text-decoration:none">
-      <span class="blue">TOTAL PELANGGAN / SECRET PPPoE</span>
-      <div class="stat">{{total}}</div>Klik untuk melihat semua akun →
+
+    <a href="/pppoe" class="card" style="text-decoration:none">
+        <span class="blue">TOTAL PELANGGAN / SECRET PPPoE</span>
+        <div class="stat">{{ total }}</div>
+        Klik untuk melihat semua akun →
     </a>
+
+    <h3>Menu Utama</h3>
+
     <div class="grid">
-      <a class="card" href="/edit">✎<h3>Edit Pelanggan</h3>Tambah dan ubah data</a>
-      <a class="card" href="/detail">◎<h3>Detail Pelanggan</h3>Status pembayaran</a>
-      <a class="card" href="/bandwidth">▥<h3>Laporan Bandwidth</h3>Pemakaian satu bulan</a>
-      <a class="card" href="/routers">▤<h3>Router</h3>Kelola koneksi router</a>
+        <a href="/edit" class="menu-card">✎<br>Edit Pelanggan</a>
+        <a href="/detail" class="menu-card">◎<br>Detail Pelanggan</a>
+        <a href="/bandwidth" class="menu-card">▥<br>Laporan Bandwidth</a>
+        <a href="/routers" class="menu-card">▤<br>Router</a>
     </div>
-    <div class="card">
-      <h3>Ringkasan Pembayaran</h3>
-      <div class="grid">
-      <div><span class="green">Lunas</span><div class="stat">{{paid}}</div></div>
-      <div><span class="red">Belum Lunas</span><div class="stat">{{unpaid}}</div></div>
-      </div>
-    </div>
-    <div class="card"><h3>Status Router</h3>
-    {% for r in routers %}
-    <p>{{r.name}} — {{r.host}}</p>
-    {% else %}<p>Belum ada router. Tambahkan router terlebih dahulu.</p>{% endfor %}
+
+    <div class="card" style="margin-top:18px">
+        <h3>Ringkasan Pembayaran</h3>
+        <div class="grid">
+            <div>
+                <span class="green">LUNAS</span>
+                <div class="stat">{{ paid }}</div>
+            </div>
+            <div>
+                <span class="red">BELUM LUNAS</span>
+                <div class="stat">{{ unpaid }}</div>
+            </div>
+        </div>
     </div>
     """
-    return page(content, on=len(online), off=len(offline), total=len(all_data),
-                paid=paid, unpaid=unpaid, routers=all_routers)
+
+    return page(
+        content,
+        on=len(online),
+        off=len(offline),
+        total=len(all_data),
+        paid=paid,
+        unpaid=unpaid
+    )
+
+
+# ==================================================
+# ONLINE
+# ==================================================
 
 @app.route("/online")
 def online_page():
     try:
-        _, online, _, _ = get_data()
+        _, online, _ = get_monitor_data()
     except Exception:
         online = []
+
+    q = request.args.get("q", "").lower().strip()
+
+    if q:
+        online = [
+            c for c in online
+            if q in c.get("username", "").lower()
+            or q in c.get("ip", "").lower()
+        ]
+
     content = """
-    <div class="card"><h3 class="green">Pelanggan Online ({{items|length}})</h3>
-    {% for c in items %}
-      <div class="card"><span class="badge">ONLINE</span> <b>{{c.ip or 'IP belum tersedia'}}</b></div>
-    {% else %}<p>Tidak ada pelanggan online.</p>{% endfor %}
+    <div class="card">
+
+        <h3 class="green">
+            Pelanggan Online ({{ items|length }})
+        </h3>
+
+        <form method="get">
+            <input
+                name="q"
+                value="{{ q }}"
+                placeholder="Cari nama atau IP pelanggan..."
+            >
+            <button class="btn" type="submit">Cari</button>
+        </form>
+
+        {% for c in items %}
+            <div class="card">
+                <span class="badge">ONLINE</span>
+                <h3>{{ c.username }}</h3>
+                IP: <b>{{ c.ip or 'IP belum tersedia' }}</b>
+            </div>
+        {% else %}
+            <p>Pelanggan tidak ditemukan.</p>
+        {% endfor %}
+
     </div>
     """
-    return page(content, items=online)
+
+    return page(content, items=online, q=q)
+
+
+# ==================================================
+# OFFLINE
+# ==================================================
 
 @app.route("/offline")
 def offline_page():
     try:
-        _, _, offline, _ = get_data()
+        _, _, offline = get_monitor_data()
     except Exception:
         offline = []
+
+    q = request.args.get("q", "").lower().strip()
+
+    if q:
+        offline = [
+            c for c in offline
+            if q in c.get("username", "").lower()
+        ]
+
     content = """
-    <div class="card"><h3 class="red">Pelanggan Offline ({{items|length}})</h3>
-    {% for c in items %}
-      <div class="card">
-        <b>{{c.username}}</b><br>
-        <span class="red">OFFLINE</span><br>
-        <span class="small">Waktu pertama terdeteksi offline: {{ c.offline_time|datetime }}</span><br>
-        Koordinat: {{c.coordinates or '-'}}
-      </div>
-    {% else %}<p>Tidak ada pelanggan offline.</p>{% endfor %}
+    <div class="card">
+
+        <h3 class="red">
+            Pelanggan Offline ({{ items|length }})
+        </h3>
+
+        <form method="get">
+            <input
+                name="q"
+                value="{{ q }}"
+                placeholder="Cari nama pelanggan..."
+            >
+            <button class="btn" type="submit">Cari</button>
+        </form>
+
+        {% for c in items %}
+            <div class="card">
+                <h3>{{ c.username }}</h3>
+                <span class="badge red">OFFLINE</span>
+                <hr>
+                Waktu terdeteksi mati:<br>
+                <b>{{ c.offline_time|datetime }}</b>
+                <hr>
+                Koordinat pelanggan:<br>
+                {{ c.coordinates or 'Belum diisi' }}
+
+                {% if c.coordinates %}
+                <p>
+                    <a
+                        target="_blank"
+                        href="https://www.google.com/maps?q={{ c.coordinates }}"
+                    >Lihat Google Maps →</a>
+                </p>
+                {% endif %}
+            </div>
+        {% else %}
+            <p>Tidak ada pelanggan offline.</p>
+        {% endfor %}
+
     </div>
     """
-    app.jinja_env.filters["datetime"] = format_time
-    return page(content, items=offline)
 
-def format_time(value):
-    if not value:
-        return "Belum tercatat"
-    return datetime.fromtimestamp(float(value)).strftime("%d-%m-%Y %H:%M:%S")
+    return page(content, items=offline, q=q)
+
+
+# ==================================================
+# SEMUA SECRET PPPoE
+# ==================================================
 
 @app.route("/pppoe")
 def pppoe_page():
-    all_data = customers()
+    all_data = get_customers()
+
+    q = request.args.get("q", "").lower().strip()
+
+    if q:
+        all_data = [
+            c for c in all_data
+            if q in c.get("username", "").lower()
+        ]
+
     content = """
-    <div class="card"><h3>Semua Secret PPPoE ({{items|length}})</h3>
-    {% for c in items %}
-      <div class="card">
-      <b>{{c.username}}</b><br>
-      Profil: {{c.profile or '-'}}<br>
-      <span class="small">Status koneksi: {{'Online' if c.online else 'Offline'}}</span>
-      </div>
-    {% else %}<p>Belum ada data. Periksa koneksi router.</p>{% endfor %}
+    <div class="card">
+
+        <h3>Semua Secret PPPoE ({{ items|length }})</h3>
+
+        <form method="get">
+            <input
+                name="q"
+                value="{{ q }}"
+                placeholder="Cari user PPPoE..."
+            >
+            <button class="btn" type="submit">Cari</button>
+        </form>
+
+        {% for c in items %}
+            <div class="card">
+                <b>{{ c.username }}</b><br>
+                Profil: {{ c.profile or '-' }}<br>
+                IP: {{ c.ip or '-' }}<br>
+
+                {% if c.online %}
+                    <span class="badge">ONLINE</span>
+                {% else %}
+                    <span class="badge red">OFFLINE</span>
+                {% endif %}
+            </div>
+        {% else %}
+            <p>Belum ada data PPPoE.</p>
+        {% endfor %}
+
     </div>
     """
-    return page(content, items=all_data)
+
+    return page(content, items=all_data, q=q)
+
+
+# ==================================================
+# TAMBAH DAN EDIT PELANGGAN
+# ==================================================
 
 @app.route("/edit", methods=["GET", "POST"])
 def edit_page():
+
     if request.method == "POST":
-        data = customers()
+        data = get_customers()
+
         username = request.form.get("username", "").strip()
+        rid = request.form.get("router", "0")
+
         if not username:
             flash("User PPPoE wajib diisi.")
             return redirect("/edit")
 
-        if any(c.get("username") == username and c.get("router") == request.form.get("router", "0") for c in data):
-            flash("User tersebut sudah ada.")
+        exists = any(
+            c.get("username") == username
+            and str(c.get("router", "0")) == rid
+            for c in data
+        )
+
+        if exists:
+            flash("User pelanggan sudah ada.")
             return redirect("/edit")
 
         data.append({
-            "router": request.form.get("router", "0"),
+            "router": rid,
             "username": username,
             "password": request.form.get("password", ""),
             "profile": request.form.get("profile", ""),
@@ -370,180 +784,527 @@ def edit_page():
             "payment": "Belum Lunas",
             "online": False
         })
+
         save_customers(data)
-        flash("Data pelanggan disimpan di aplikasi. Secret router belum dibuat.")
+
+        flash(
+            "Data disimpan di aplikasi. "
+            "Akun Secret MikroTik belum dibuat."
+        )
+
         return redirect("/edit")
 
-    all_data = customers()
-    all_routers = routers()
+    all_data = get_customers()
+    all_routers = get_routers()
+
     content = """
     <div class="card">
-    <h3>Tambah Pelanggan Baru</h3>
-    <form method="post">
-      <label>Router</label>
-      <select name="router">
-      {% for r in routers %}<option value="{{loop.index0}}">{{r.name}}</option>{% endfor %}
-      </select>
-      <label>User PPPoE</label><input name="username" required>
-      <label>Sandi PPPoE</label><input name="password" type="password">
-      <label>Profil PPPoE</label><input name="profile" placeholder="Contoh: 5Mbps-30Hari">
-      <label>Nomor HP</label><input name="phone" placeholder="08xxxxxxxxxx">
-      <label>Koordinat GPS</label><input name="coordinates" placeholder="-1.234567, 123.456789">
-      <button class="btn btn-green" type="submit">Simpan Pelanggan</button>
-    </form>
+
+        <h3>Tambah Pelanggan Baru</h3>
+
+        <form method="post">
+
+            <label>Router</label>
+            <select name="router">
+                {% for r in routers %}
+                    <option value="{{ loop.index0 }}">
+                        {{ r.name }}
+                    </option>
+                {% endfor %}
+            </select>
+
+            <label>User PPPoE</label>
+            <input name="username" required>
+
+            <label>Sandi PPPoE</label>
+            <input name="password" type="password">
+
+            <label>Profil PPPoE</label>
+            <input
+                name="profile"
+                placeholder="Contoh: 5Mbps-30Hari"
+            >
+
+            <label>Nomor HP</label>
+            <input
+                name="phone"
+                placeholder="08xxxxxxxxxx"
+            >
+
+            <label>Koordinat GPS</label>
+            <input
+                name="coordinates"
+                placeholder="-1.234567, 123.456789"
+            >
+
+            <button class="btn btn-green" type="submit">
+                Simpan Pelanggan
+            </button>
+
+        </form>
+
     </div>
-    <div class="card"><h3>Daftar Pelanggan</h3>
-    {% for c in items %}
-      <div class="card">
-      <b>{{c.username}}</b> — {{c.ip or '-'}}<br>
-      HP: {{c.phone or '-'}}<br>
-      <a href="/customer/{{loop.index0}}">Edit data →</a>
-      </div>
-    {% else %}<p>Belum ada pelanggan.</p>{% endfor %}
+
+    <div class="card">
+        <h3>Daftar Pelanggan</h3>
+
+        {% for c in items %}
+            <div class="card">
+                <b>{{ c.username }}</b><br>
+                IP: {{ c.ip or '-' }}<br>
+                HP: {{ c.phone or '-' }}<br>
+                <a href="/customer/{{ loop.index0 }}">
+                    Edit data →
+                </a>
+            </div>
+        {% else %}
+            <p>Belum ada pelanggan.</p>
+        {% endfor %}
     </div>
     """
+
     return page(content, items=all_data, routers=all_routers)
+
+
+# ==================================================
+# DETAIL DAN EDIT DATA PELANGGAN
+# ==================================================
 
 @app.route("/customer/<int:index>", methods=["GET", "POST"])
 def customer_page(index):
-    data = customers()
-    if index >= len(data):
+
+    data = get_customers()
+
+    if index < 0 or index >= len(data):
+        flash("Data pelanggan tidak ditemukan.")
         return redirect("/edit")
-    c = data[index]
+
+    customer = data[index]
 
     if request.method == "POST":
-        c["phone"] = request.form.get("phone", "")
-        c["coordinates"] = request.form.get("coordinates", "")
-        c["payment"] = request.form.get("payment", "Belum Lunas")
+        customer["phone"] = request.form.get("phone", "")
+        customer["coordinates"] = request.form.get("coordinates", "")
+        customer["payment"] = request.form.get(
+            "payment", "Belum Lunas"
+        )
+
         save_customers(data)
+
         flash("Perubahan data pelanggan disimpan.")
         return redirect("/detail")
 
     content = """
     <div class="card">
-    <h3>Detail Pelanggan: {{c.username}}</h3>
-    <p>IP PPPoE: {{c.ip or '-'}}</p>
-    <form method="post">
-      <label>Nomor HP</label><input name="phone" value="{{c.phone}}">
-      <label>Koordinat GPS</label><input name="coordinates" value="{{c.coordinates}}">
-      <label>Status Pembayaran</label>
-      <select name="payment">
-        <option {% if c.payment == 'Lunas' %}selected{% endif %}>Lunas</option>
-        <option {% if c.payment != 'Lunas' %}selected{% endif %}>Belum Lunas</option>
-      </select>
-      <button class="btn btn-green" type="submit">Simpan Perubahan</button>
-    </form>
-    {% if c.coordinates %}
-    <p><a target="_blank" href="https://www.google.com/maps?q={{c.coordinates}}">Lihat Google Maps →</a></p>
-    {% endif %}
+
+        <h3>Edit Data Pelanggan</h3>
+
+        <p>
+            User PPPoE:<br>
+            <b>{{ c.username }}</b>
+        </p>
+
+        <p>
+            IP PPPoE:<br>
+            <b>{{ c.ip or '-' }}</b>
+        </p>
+
+        <form method="post">
+
+            <label>Nomor HP</label>
+            <input
+                name="phone"
+                value="{{ c.phone }}"
+            >
+
+            <label>Koordinat GPS</label>
+            <input
+                name="coordinates"
+                value="{{ c.coordinates }}"
+            >
+
+            <label>Status Pembayaran</label>
+            <select name="payment">
+                <option
+                    value="Lunas"
+                    {% if c.payment == 'Lunas' %}selected{% endif %}
+                >
+                    Lunas
+                </option>
+
+                <option
+                    value="Belum Lunas"
+                    {% if c.payment != 'Lunas' %}selected{% endif %}
+                >
+                    Belum Lunas
+                </option>
+            </select>
+
+            <button class="btn btn-green" type="submit">
+                Simpan Perubahan
+            </button>
+
+        </form>
+
+        {% if c.coordinates %}
+            <p>
+                <a
+                    target="_blank"
+                    href="https://www.google.com/maps?q={{ c.coordinates }}"
+                >
+                    Lihat Google Maps →
+                </a>
+            </p>
+        {% endif %}
+
     </div>
     """
-    return page(content, c=c)
+
+    return page(content, c=customer)
+
+
+# ==================================================
+# DETAIL PELANGGAN DAN PEMBAYARAN
+# ==================================================
 
 @app.route("/detail")
 def detail_page():
-    all_data = customers()
+
+    all_data = get_customers()
+
+    q = request.args.get("q", "").lower().strip()
+    payment_filter = request.args.get("status", "Semua")
+
+    if q:
+        all_data = [
+            c for c in all_data
+            if q in c.get("username", "").lower()
+            or q in c.get("ip", "").lower()
+            or q in c.get("phone", "").lower()
+        ]
+
+    if payment_filter in ["Lunas", "Belum Lunas"]:
+        all_data = [
+            c for c in all_data
+            if c.get("payment", "Belum Lunas") == payment_filter
+        ]
+
+    # Pertahankan indeks asli pelanggan untuk tombol detail/pelunasan.
+    original_data = get_customers()
+
+    for c in all_data:
+        c["index"] = next(
+            i for i, original in enumerate(original_data)
+            if original.get("router") == c.get("router")
+            and original.get("username") == c.get("username")
+        )
+
     content = """
-    <div class="card"><h3>Detail Pelanggan dan Pembayaran</h3>
-    {% for c in items %}
-      <div class="card">
-      <a href="/customer/{{loop.index0}}"><b>{{c.username}}</b></a><br>
-      {{c.ip or '-'}} | {{c.phone or '-'}}<br>
-      {% if c.payment == 'Lunas' %}
-        <span class="badge">LUNAS</span>
-      {% else %}
-        <span class="badge red">BELUM LUNAS</span>
-      {% endif %}
-      </div>
-    {% else %}<p>Belum ada data pelanggan.</p>{% endfor %}
+    <div class="card">
+
+        <h3>Detail Pelanggan dan Pembayaran</h3>
+
+        <form method="get">
+            <input
+                name="q"
+                value="{{ q }}"
+                placeholder="Cari nama, IP, atau nomor HP..."
+            >
+
+            <select name="status">
+                <option value="Semua"
+                    {% if status == 'Semua' %}selected{% endif %}>
+                    Semua Pelanggan
+                </option>
+
+                <option value="Lunas"
+                    {% if status == 'Lunas' %}selected{% endif %}>
+                    Lunas
+                </option>
+
+                <option value="Belum Lunas"
+                    {% if status == 'Belum Lunas' %}selected{% endif %}>
+                    Belum Lunas
+                </option>
+            </select>
+
+            <button class="btn" type="submit">
+                Cari Pelanggan
+            </button>
+        </form>
+
+        {% for c in items %}
+            <div class="card">
+
+                <a href="/customer/{{ c.index }}">
+                    <b>{{ c.username }}</b>
+                </a>
+
+                <br>
+                IP: {{ c.ip or '-' }}
+                <br>
+                HP: {{ c.phone or '-' }}
+                <br>
+
+                {% if c.payment == 'Lunas' %}
+                    <span class="badge">LUNAS</span>
+                {% else %}
+                    <span class="badge red">BELUM LUNAS</span>
+
+                    <form
+                        method="post"
+                        action="/pelunasan/{{ c.index }}"
+                        onsubmit="return confirm('Konfirmasi pelanggan sudah membayar?')"
+                    >
+                        <button class="btn btn-green" type="submit">
+                            Pelunasan
+                        </button>
+                    </form>
+                {% endif %}
+
+                <p>
+                    <a href="/customer/{{ c.index }}">
+                        Lihat detail / Edit →
+                    </a>
+                </p>
+
+            </div>
+        {% else %}
+            <p>Pelanggan tidak ditemukan.</p>
+        {% endfor %}
+
     </div>
     """
-    return page(content, items=all_data)
+
+    return page(
+        content,
+        items=all_data,
+        q=q,
+        status=payment_filter
+    )
+
+
+@app.route("/pelunasan/<int:index>", methods=["POST"])
+def pelunasan(index):
+
+    data = get_customers()
+
+    if index < 0 or index >= len(data):
+        flash("Data pelanggan tidak ditemukan.")
+        return redirect("/detail")
+
+    data[index]["payment"] = "Lunas"
+    save_customers(data)
+
+    flash("Status pembayaran berhasil diubah menjadi Lunas.")
+
+    return redirect("/detail")
+
+
+# ==================================================
+# LAPORAN BANDWIDTH BULANAN
+# ==================================================
 
 @app.route("/bandwidth")
 def bandwidth_page():
-    all_data = customers()
-    total = sum(int(c.get("month_rx", 0)) + int(c.get("month_tx", 0)) for c in all_data)
+
+    all_data = get_customers()
+    state = get_states()
+
+    total_rx = 0
+    total_tx = 0
+
+    for c in all_data:
+        rid = str(c.get("router", "0"))
+        username = c.get("username", "")
+
+        info = state.get(rid, {}).get(username, {})
+
+        c["month_rx"] = int(info.get("month_rx", 0))
+        c["month_tx"] = int(info.get("month_tx", 0))
+
+        total_rx += c["month_rx"]
+        total_tx += c["month_tx"]
+
     content = """
     <div class="card">
-    <h3>Laporan Bandwidth PPPoE</h3>
-    <p>Total tercatat sejak monitoring aktif bulan ini:</p>
-    <div class="stat blue">{{total|bytes}}</div>
-    <p class="small">Catatan: penghitung mulai merekam sejak aplikasi melakukan monitoring. Ini bukan data historis sebelum monitoring aktif.</p>
+
+        <h3>Laporan Bandwidth Bulanan</h3>
+
+        <p class="small">
+            Bulan: {{ month }}
+        </p>
+
+        <div class="grid">
+            <div>
+                <span class="blue">DOWNLOAD</span>
+                <div class="stat">{{ rx|bytes }}</div>
+            </div>
+
+            <div>
+                <span class="green">UPLOAD</span>
+                <div class="stat">{{ tx|bytes }}</div>
+            </div>
+        </div>
+
+        <hr>
+
+        <h3>Bandwidth Per Pelanggan</h3>
+
+        {% for c in items %}
+            <div class="card">
+                <b>{{ c.username }}</b>
+                <hr>
+                Download: {{ c.month_rx|bytes }}<br>
+                Upload: {{ c.month_tx|bytes }}<br>
+                Total: {{ (c.month_rx + c.month_tx)|bytes }}
+            </div>
+        {% else %}
+            <p>Belum ada data bandwidth.</p>
+        {% endfor %}
+
+        <p class="small">
+            Penghitungan dimulai sejak aplikasi memonitor router.
+            Data historis sebelum monitoring tidak tersedia.
+        </p>
+
     </div>
-    {% for c in items %}
-    <div class="card">
-      <b>{{c.username}}</b><br>
-      Download: {{c.month_rx|bytes}}<br>
-      Upload: {{c.month_tx|bytes}}<br>
-      Total: {{(c.month_rx+c.month_tx)|bytes}}
-    </div>
-    {% endfor %}
     """
-    return page(content, items=all_data, total=total)
 
-def format_bytes(value):
-    value = float(value or 0)
-    for unit in ["B", "KB", "MB", "GB", "TB"]:
-        if value < 1024:
-            return "%.2f %s" % (value, unit)
-        value /= 1024
-    return "%.2f PB" % value
+    return page(
+        content,
+        items=all_data,
+        rx=total_rx,
+        tx=total_tx,
+        month=datetime.now().strftime("%B %Y")
+    )
 
-app.jinja_env.filters["bytes"] = format_bytes
+
+# ==================================================
+# TAMBAH ROUTER
+# ==================================================
 
 @app.route("/routers", methods=["GET", "POST"])
 def router_page():
-    data = routers()
+
+    data = get_routers()
+
     if request.method == "POST":
+
         host = request.form.get("host", "").strip()
-        if host:
-            data.append({
-                "name": request.form.get("name", "Router"),
-                "host": host,
-                "username": request.form.get("username", "admin"),
-                "password": request.form.get("password", ""),
-                "port": request.form.get("port", "8728")
-            })
-            write_json(ROUTERS_FILE, data)
-            flash("Router disimpan di aplikasi.")
+        username = request.form.get("username", "").strip()
+
+        if not host or not username:
+            flash("IP router dan username wajib diisi.")
+            return redirect("/routers")
+
+        data.append({
+            "name": request.form.get("name", "Router"),
+            "host": host,
+            "username": username,
+            "password": request.form.get("password", ""),
+            "port": request.form.get("port", "8728")
+        })
+
+        write_json(ROUTERS_FILE, data)
+
+        flash("Router berhasil disimpan di aplikasi.")
         return redirect("/routers")
 
     content = """
-    <div class="card"><h3>Tambah Router MikroTik</h3>
-    <form method="post">
-      <label>Nama Router</label><input name="name" placeholder="Nama router">
-      <label>IP / ZeroTier</label><input name="host" required placeholder="192.168.1.1">
-      <label>Username API</label><input name="username" required>
-      <label>Password</label><input name="password" type="password">
-      <label>Port API</label><input name="port" value="8728">
-      <button class="btn btn-green">Simpan Router</button>
-    </form></div>
-    <div class="card"><h3>Router Terdaftar</h3>
-    {% for r in items %}
-      <div class="card"><b>{{r.name}}</b><br>{{r.host}}:{{r.port}}</div>
-    {% else %}<p>Belum ada router.</p>{% endfor %}
+    <div class="card">
+
+        <h3>Tambah Router MikroTik</h3>
+
+        <form method="post">
+
+            <label>Nama Router</label>
+            <input name="name" placeholder="Nama router">
+
+            <label>IP / ZeroTier</label>
+            <input
+                name="host"
+                required
+                placeholder="192.168.1.1"
+            >
+
+            <label>Username API</label>
+            <input name="username" required>
+
+            <label>Password</label>
+            <input name="password" type="password">
+
+            <label>Port API</label>
+            <input name="port" value="8728">
+
+            <button class="btn btn-green" type="submit">
+                Simpan Router
+            </button>
+
+        </form>
+
+    </div>
+
+    <div class="card">
+
+        <h3>Router Terdaftar</h3>
+
+        {% for r in items %}
+            <div class="card">
+                <b>{{ r.name }}</b><br>
+                {{ r.host }}:{{ r.port }}
+            </div>
+        {% else %}
+            <p>Belum ada router.</p>
+        {% endfor %}
+
     </div>
     """
+
     return page(content, items=data)
+
+
+# ==================================================
+# CEK SERVER
+# ==================================================
 
 @app.route("/health")
 def health():
-    return {"status": "ok", "app": "Manajemen MikroTik"}
+    return {
+        "status": "ok",
+        "app": "Manajemen MikroTik"
+    }
+
+
+# ==================================================
+# START SERVER ANDROID / CHAQUOPY
+# ==================================================
 
 def start_server(data_dir=None):
-    global DATA_DIR, ROUTERS_FILE, CUSTOMERS_FILE, STATE_FILE
+
+    global DATA_DIR
+    global ROUTERS_FILE
+    global CUSTOMERS_FILE
+    global STATE_FILE
+
     if data_dir:
         DATA_DIR = data_dir
+
         os.makedirs(DATA_DIR, exist_ok=True)
+
         ROUTERS_FILE = os.path.join(DATA_DIR, "routers.json")
         CUSTOMERS_FILE = os.path.join(DATA_DIR, "customers.json")
         STATE_FILE = os.path.join(DATA_DIR, "state.json")
 
     thread = threading.Thread(
-        target=lambda: app.run(host="127.0.0.1", port=8765, debug=False, use_reloader=False),
+        target=lambda: app.run(
+            host="127.0.0.1",
+            port=8765,
+            debug=False,
+            use_reloader=False
+        ),
         daemon=True
     )
+
     thread.start()
+
     return True
-        
