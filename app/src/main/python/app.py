@@ -1214,6 +1214,16 @@ def router_page():
 
             </form>
 
+            <form method="post"
+            action="/router-delete/{{loop.index0}}"
+            onsubmit="return confirm('Hapus router ini dari aplikasi? Data pelanggan lokal dan riwayat monitoring milik router ini juga akan dihapus. Konfigurasi di perangkat MikroTik tidak berubah.');">
+
+                <button class="btn btn-red" type="submit">
+                    Hapus Router
+                </button>
+
+            </form>
+
         </div>
 
         {% else %}
@@ -1224,6 +1234,61 @@ def router_page():
     """
 
     return page(content, items=data)
+
+
+@app.route("/router-delete/<int:index>", methods=["POST"])
+def router_delete(index):
+    routers = get_routers()
+
+    if index < 0 or index >= len(routers):
+        flash("Router tidak ditemukan.")
+        return redirect("/routers")
+
+    # Hapus router dari daftar aplikasi.
+    routers.pop(index)
+    write_json(ROUTERS_FILE, routers)
+
+    # Hapus data pelanggan lokal milik router tersebut.
+    customers = get_customers()
+    kept_customers = []
+
+    for customer in customers:
+        try:
+            customer_router = int(customer.get("router", 0))
+        except (TypeError, ValueError):
+            customer_router = 0
+
+        if customer_router == index:
+            continue
+
+        # Rapikan indeks router lain yang bergeser.
+        if customer_router > index:
+            customer["router"] = str(customer_router - 1)
+
+        kept_customers.append(customer)
+
+    save_customers(kept_customers)
+
+    # Hapus status monitoring router ini dan rapikan indeks lainnya.
+    old_states = get_states()
+    new_states = {}
+
+    for old_id, state in old_states.items():
+        try:
+            state_index = int(old_id)
+        except (TypeError, ValueError):
+            continue
+
+        if state_index == index:
+            continue
+
+        new_id = str(state_index - 1 if state_index > index else state_index)
+        new_states[new_id] = state
+
+    save_states(new_states)
+
+    flash("Router dan data lokal terkait berhasil dihapus dari aplikasi. Konfigurasi MikroTik tidak berubah.")
+    return redirect("/routers")
 
 
 @app.route("/router-connect/<int:index>", methods=["POST"])
