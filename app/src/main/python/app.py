@@ -15,6 +15,7 @@ DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 ROUTERS_FILE = os.path.join(DATA_DIR, "routers.json")
 CUSTOMERS_FILE = os.path.join(DATA_DIR, "customers.json")
 STATE_FILE = os.path.join(DATA_DIR, "state.json")
+ACTIVE_ROUTER_FILE = os.path.join(DATA_DIR, "active_router.json")
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -51,6 +52,49 @@ def get_customers():
 
 def get_states():
     return read_json(STATE_FILE, {})
+
+
+def get_active_router_index():
+    """Mengambil indeks router aktif; router pertama menjadi pilihan awal."""
+    routers = get_routers()
+    if not routers:
+        return None
+
+    saved = read_json(ACTIVE_ROUTER_FILE, {"index": 0})
+    if not isinstance(saved, dict) or "index" not in saved:
+        return 0
+
+    index = saved.get("index")
+    if index is None:
+        return None
+
+    try:
+        index = int(index)
+    except (TypeError, ValueError):
+        return 0
+
+    return index if 0 <= index < len(routers) else 0
+
+
+def set_active_router_index(index):
+    write_json(ACTIVE_ROUTER_FILE, {"index": None if index is None else int(index)})
+
+
+def get_active_customers(customers=None):
+    """Mengambil pelanggan dari router aktif tanpa mengubah indeks data asli."""
+    if customers is None:
+        customers = get_customers()
+
+    routers = get_routers()
+    active_index = get_active_router_index()
+
+    if active_index is None:
+        return customers if not routers else []
+
+    return [
+        customer for customer in customers
+        if str(customer.get("router", "0")) == str(active_index)
+    ]
 
 
 def save_customers(data):
@@ -132,123 +176,128 @@ def fetch_router(router):
 # MONITORING PELANGGAN
 # =====================================================
 
-def update_monitor():
+def update_monitor(router_index=None, router_data=None):
+    """Monitor hanya router aktif; dapat menerima hasil fetch yang sudah ada."""
     routers = get_routers()
+
+    if router_index is None:
+        router_index = get_active_router_index()
+
+    if router_index is None or router_index < 0 or router_index >= len(routers):
+        return
+
+    router = routers[router_index]
+    rid = str(router_index)
     customers = get_customers()
     states = get_states()
-
     now = time.time()
     month_key = datetime.now().strftime("%Y-%m")
 
-    for ridx, router in enumerate(routers):
-        rid = str(ridx)
-
+    if router_data is None:
         active, secrets, status = fetch_router(router)
+    else:
+        active, secrets, status = router_data
 
-        if rid not in states:
-            states[rid] = {}
+    if rid not in states:
+        states[rid] = {}
 
-        states[rid]["router_status"] = status
+    states[rid]["router_status"] = status
 
-        active_map = {
-            x.get("name"): x
-            for x in active
-            if x.get("name")
-        }
+    if status != "Terhubung":
+        save_states(states)
+        return
 
-        for secret in secrets:
-            username = secret.get("name", "").strip()
+    active_map = {
+        x.get("name"): x for x in active if x.get("name")
+    }
+    secret_names = set()
 
-            if not username:
-                continue
+    for secret in secrets:
+        username = secret.get("name", "").strip()
+        if not username:
+            continue
 
+        secret_names.add(username)
+        info = states[rid].get(username, {})
+        is_online = username in active_map
+
+        if is_online:
+            if not info.get("online", False):
+                info["online_since"] = now
+            info["offline_since"] = None
+        else:
+            if info.get("online", False) or not info.get("offline_since"):
+                info["offline_since"] = now
+
+        info["online"] = is_online
+
+        if info.get("month_key") != month_key:
+            info["month_key"] = month_key
+            info["month_rx"] = 0
+            info["month_tx"] = 0
+            info["traffic"] = {"rx": 0, "tx": 0}
+
+        if is_online:
+            session = active_map[username]
+            rx = int(session.get("bytes-in", 0) or 0)
+            tx = int(session.get("bytes-out", 0) or 0)
+            previous = info.get("traffic", {})
+            old_rx = int(previous.get("rx", 0))
+            old_tx = int(previous.get("tx", 0))
+
+            info["month_rx"] = int(info.get("month_rx", 0))
+            info["month_tx"] = int(info.get("month_tx", 0))
+            info["month_rx"] += max(0, rx - old_rx) if rx >= old_rx else rx
+            info["month_tx"] += max(0, tx - old_tx) if tx >= old_tx else tx
+            info["traffic"] = {"rx": rx, "tx": tx}
+            info["last_seen"] = now
+
+        states[rid][username] = info
+        found = None
+        for customer in customers:
+            if (str(customer.get("router", "0")) == rid
+                    and customer.get("username") == username):
+                found = customer
+                break
+
+        ip = active_map[username].get("address", "") if is_online else ""
+        if found:
+            found["ip"] = ip or found.get("ip", "")
+            found["profile"] = secret.get("profile", "")
+            found["online"] = is_online
+        else:
+            customers.append({
+                "router": rid,
+                "username": username,
+                "password": "",
+                "profile": secret.get("profile", ""),
+                "ip": ip,
+                "phone": "",
+                "coordinates": "",
+                "payment": "Belum Lunas",
+                "online": is_online
+            })
+
+    # Pelanggan yang secret-nya sudah tidak ada di router aktif ditandai offline.
+    for customer in customers:
+        if str(customer.get("router", "0")) != rid:
+            continue
+        username = customer.get("username", "")
+        if username and username not in secret_names:
             info = states[rid].get(username, {})
-            is_online = username in active_map
-
-            if is_online:
-                if not info.get("online", False):
-                    info["online_since"] = now
-
-                info["offline_since"] = None
-
-            else:
-                if info.get("online", False) or not info.get("offline_since"):
-                    info["offline_since"] = now
-
-            info["online"] = is_online
-
-            if info.get("month_key") != month_key:
-                info["month_key"] = month_key
-                info["month_rx"] = 0
-                info["month_tx"] = 0
-                info["traffic"] = {"rx": 0, "tx": 0}
-
-            if is_online:
-                session = active_map[username]
-
-                rx = int(session.get("bytes-in", 0) or 0)
-                tx = int(session.get("bytes-out", 0) or 0)
-
-                previous = info.get("traffic", {})
-                old_rx = int(previous.get("rx", 0))
-                old_tx = int(previous.get("tx", 0))
-
-                info["month_rx"] = int(info.get("month_rx", 0))
-                info["month_tx"] = int(info.get("month_tx", 0))
-
-                info["month_rx"] += max(0, rx - old_rx) if rx >= old_rx else rx
-                info["month_tx"] += max(0, tx - old_tx) if tx >= old_tx else tx
-
-                info["traffic"] = {
-                    "rx": rx,
-                    "tx": tx
-                }
-
-                info["last_seen"] = now
-
+            if info.get("online", False) or not info.get("offline_since"):
+                info["offline_since"] = now
+            info["online"] = False
             states[rid][username] = info
-
-            found = None
-
-            for customer in customers:
-                if (
-                    str(customer.get("router", "0")) == rid
-                    and customer.get("username") == username
-                ):
-                    found = customer
-                    break
-
-            ip = ""
-
-            if is_online:
-                ip = active_map[username].get("address", "")
-
-            if found:
-                found["ip"] = ip or found.get("ip", "")
-                found["profile"] = secret.get("profile", "")
-                found["online"] = is_online
-
-            else:
-                customers.append({
-                    "router": rid,
-                    "username": username,
-                    "password": "",
-                    "profile": secret.get("profile", ""),
-                    "ip": ip,
-                    "phone": "",
-                    "coordinates": "",
-                    "payment": "Belum Lunas",
-                    "online": is_online
-                })
+            customer["online"] = False
 
     save_customers(customers)
     save_states(states)
 
-
 def get_monitor_data():
     update_monitor()
 
-    customers = get_customers()
+    customers = get_active_customers()
     states = get_states()
 
     online = []
@@ -469,7 +518,7 @@ def home():
     try:
         all_data, online, offline = get_monitor_data()
     except Exception:
-        all_data = get_customers()
+        all_data = get_active_customers()
         online = []
         offline = all_data
 
@@ -664,7 +713,7 @@ def offline_page():
 
 @app.route("/pppoe")
 def pppoe_page():
-    all_data = get_customers()
+    all_data = get_active_customers()
 
     q = request.args.get("q", "").lower().strip()
 
@@ -757,8 +806,20 @@ def edit_page():
 
         return redirect("/edit")
 
-    items = get_customers()
+    all_customers = get_customers()
     routers = get_routers()
+    active_index = get_active_router_index()
+
+    items = []
+    for original_index, customer in enumerate(all_customers):
+        if active_index is not None:
+            if str(customer.get("router", "0")) != str(active_index):
+                continue
+        elif routers:
+            continue
+        item = dict(customer)
+        item["index"] = original_index
+        items.append(item)
 
     content = """
     <div class="card">
@@ -770,7 +831,8 @@ def edit_page():
             <label>Router</label>
             <select name="router">
                 {% for r in routers %}
-                <option value="{{loop.index0}}">
+                <option value="{{loop.index0}}"
+                {% if active_index == loop.index0 %}selected{% endif %}>
                     {{r.name}}
                 </option>
                 {% endfor %}
@@ -810,7 +872,7 @@ def edit_page():
             IP: {{c.ip or '-'}}<br>
             HP: {{c.phone or '-'}}<br>
 
-            <a href="/customer/{{loop.index0}}">
+            <a href="/customer/{{c.index}}">
                 Edit data →
             </a>
 
@@ -822,7 +884,12 @@ def edit_page():
     </div>
     """
 
-    return page(content, items=items, routers=routers)
+    return page(
+        content,
+        items=items,
+        routers=routers,
+        active_index=active_index
+    )
 
 
 # =====================================================
@@ -918,7 +985,15 @@ def detail_page():
 
     items = []
 
+    active_index = get_active_router_index()
+
     for index, c in enumerate(original):
+        if active_index is not None:
+            if str(c.get("router", "0")) != str(active_index):
+                continue
+        elif get_routers():
+            continue
+
         item = dict(c)
         item["index"] = index
 
@@ -1046,7 +1121,7 @@ def pelunasan(index):
 
 @app.route("/bandwidth")
 def bandwidth_page():
-    items = get_customers()
+    items = get_active_customers()
     states = get_states()
 
     total_rx = 0
@@ -1148,16 +1223,25 @@ def router_page():
 
         write_json(ROUTERS_FILE, data)
 
+        if get_active_router_index() is None:
+            set_active_router_index(len(data) - 1)
+
         flash("Router disimpan. Silakan tekan Hubungkan.")
 
         return redirect("/routers")
 
     states = get_states()
+    active_index = get_active_router_index()
 
     for i, r in enumerate(data):
         r["status"] = states.get(str(i), {}).get(
             "router_status", "Belum dites"
         )
+        r["is_active"] = (i == active_index)
+        if r["is_active"]:
+            r["status_display"] = r["status"]
+        else:
+            r["status_display"] = "Tidak dipantau (terakhir: " + r["status"] + ")"
 
     content = """
     <div class="card">
@@ -1198,12 +1282,16 @@ def router_page():
 
             <h3>{{r.name}}</h3>
 
+            {% if r.is_active %}
+            <span class="badge">ROUTER AKTIF</span>
+            {% endif %}
+
             {{r.host}}:{{r.port}}
 
             <hr>
 
-            Status terakhir:<br>
-            {{r.status}}
+            Status router:<br>
+            {{r.status_display}}
 
             <form method="post"
             action="/router-connect/{{loop.index0}}">
@@ -1228,7 +1316,7 @@ def router_page():
     </div>
     """
 
-    return page(content, items=data)
+    return page(content, items=data, active_index=active_index)
 
 
 @app.route("/router-delete-confirm/<int:index>", methods=["GET"])
@@ -1273,9 +1361,23 @@ def router_delete(index):
         flash("Router tidak ditemukan.")
         return redirect("/routers")
 
+    old_active_index = get_active_router_index()
+
     # Hapus router dari daftar aplikasi.
     routers.pop(index)
     write_json(ROUTERS_FILE, routers)
+
+    # Sesuaikan pilihan router aktif saat indeks daftar bergeser.
+    if not routers:
+        set_active_router_index(None)
+    elif old_active_index is None:
+        set_active_router_index(0)
+    elif old_active_index == index:
+        set_active_router_index(min(index, len(routers) - 1))
+    elif old_active_index > index:
+        set_active_router_index(old_active_index - 1)
+    else:
+        set_active_router_index(old_active_index)
 
     # Hapus data pelanggan lokal milik router tersebut.
     customers = get_customers()
@@ -1342,6 +1444,12 @@ def router_connect(index):
     save_states(states)
 
     if status == "Terhubung":
+        set_active_router_index(index)
+        update_monitor(
+            router_index=index,
+            router_data=(active, secrets, status)
+        )
+
         flash(
             "BERHASIL TERHUBUNG ke "
             + router.get("name", "MikroTik")
@@ -1374,6 +1482,7 @@ def start_server(data_dir=None):
     global ROUTERS_FILE
     global CUSTOMERS_FILE
     global STATE_FILE
+    global ACTIVE_ROUTER_FILE
 
     if data_dir:
         DATA_DIR = data_dir
@@ -1383,6 +1492,7 @@ def start_server(data_dir=None):
         ROUTERS_FILE = os.path.join(DATA_DIR, "routers.json")
         CUSTOMERS_FILE = os.path.join(DATA_DIR, "customers.json")
         STATE_FILE = os.path.join(DATA_DIR, "state.json")
+        ACTIVE_ROUTER_FILE = os.path.join(DATA_DIR, "active_router.json")
 
     thread = threading.Thread(
         target=lambda: app.run(
